@@ -54,6 +54,13 @@ def parse_args():
         default=[],
     )
 
+    parser.add_argument(
+        "--use-daemon-tools",
+        dest="use_daemon_tools",
+        help="Enable prototype daemon mode",
+        action="store_true",
+    )
+
     format_group = parser.add_argument_group("Output Format")
     # FIXME: I find these names very confusing, although I like the
     # functionality.

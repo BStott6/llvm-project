@@ -41,6 +41,7 @@ class LitConfig(object):
         per_test_coverage=False,
         gtest_sharding=True,
         update_tests=False,
+        use_daemon_tools=False,
     ):
         # The name of the test runner.
         self.progname = progname
@@ -56,6 +57,7 @@ class LitConfig(object):
         self.order = order
         self.params = dict(params)
         self.bashPath = None
+        self.use_daemon_tools = use_daemon_tools
 
         # Configuration files to look for when discovering test suites.
         self.config_prefix = config_prefix or "lit"

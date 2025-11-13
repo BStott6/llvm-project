@@ -1,4 +1,5 @@
 from __future__ import absolute_import
+import copy
 import errno
 import io
 import itertools
@@ -11,9 +12,9 @@ import platform
 import shlex
 import shutil
 import tempfile
-import threading
-import typing
 import traceback
+from enum import Enum
+from threading import Thread
 from typing import Optional, Tuple
 from io import StringIO
 
@@ -23,6 +24,11 @@ import lit.Test as Test
 import lit.util
 from lit.util import to_bytes, to_string, to_unicode
 from lit.BooleanExpression import BooleanExpression
+
+try:
+    from queue import Queue, Empty
+except ImportError:
+    from Queue import Queue, Empty
 
 
 class InternalShellError(Exception):
@@ -51,6 +57,7 @@ class TestUpdaterException(Exception):
     def __init__(self, message):
         super().__init__(message)
 
+emptyFile = tempfile.TemporaryFile()
 
 kIsWindows = platform.system() == "Windows"
 
@@ -306,7 +313,6 @@ def quote_windows_command(seq):
 
     return "".join(result)
 
-
 # args are from 'export' or 'env' command.
 # Skips the command, and parses its arguments.
 # Modifies env accordingly.
@@ -516,9 +522,7 @@ def executeBuiltinRm(cmd, cmd_shenv):
         if force and not os.path.exists(path):
             continue
         try:
-            if os.path.islink(path):
-                os.remove(path)
-            elif os.path.isdir(path):
+            if os.path.isdir(path):
                 if not recursive:
                     stderr.write("Error: %s is a directory\n" % path)
                     exitCode = 1
@@ -629,7 +633,7 @@ def processRedirects(cmd, stdin_source, cmd_shenv, opened_files):
 
     Returns the three standard file descriptors for the new child process.  Each
     fd may be an open, writable file object or a sentinel value from the
-    subprocess module.
+    subprocess module. The stdin redirect may also be a string of input to provide directly to the process.
     """
 
     # Apply the redirections, we use (N,) as a sentinel to indicate stdin,
@@ -639,17 +643,17 @@ def processRedirects(cmd, stdin_source, cmd_shenv, opened_files):
     redirects = [(0,), (1,), (2,)]
     for (op, filename) in cmd.redirects:
         if op == (">", 2):
-            redirects[2] = [filename, "w", None]
+            redirects[2] = [filename, "w+", None]
         elif op == (">>", 2):
-            redirects[2] = [filename, "a", None]
+            redirects[2] = [filename, "a+", None]
         elif op == (">&", 2) and filename in "012":
             redirects[2] = redirects[int(filename)]
         elif op == (">&",) or op == ("&>",):
             redirects[1] = redirects[2] = [filename, "w", None]
         elif op == (">",):
-            redirects[1] = [filename, "w", None]
+            redirects[1] = [filename, "w+", None]
         elif op == (">>",):
-            redirects[1] = [filename, "a", None]
+            redirects[1] = [filename, "a+", None]
         elif op == ("<",):
             redirects[0] = [filename, "r", None]
         else:
@@ -696,7 +700,7 @@ def processRedirects(cmd, stdin_source, cmd_shenv, opened_files):
             )
         name = name[0]
         if kAvoidDevNull and name == kDevNull:
-            fd = tempfile.TemporaryFile(mode=mode)
+            fd = tempfile.NamedTemporaryFile(mode=mode, delete=False)
         elif kIsWindows and name == "/dev/tty":
             # Simulate /dev/tty on Windows.
             # "CON" is a special filename for the console.
@@ -741,9 +745,194 @@ def _expandLateSubstitutions(cmd, arguments, cwd):
                     % filePath,
                 )
 
-        arguments[i] = re.sub(r"%{readfile:([^}]*)}", _replaceReadFile, arg)
-
     return arguments
+
+
+class ProcInvocation:
+    def __init__(self, proc):
+        self.proc = proc
+        self.stdin = proc.stdin
+        self.stdout = proc.stdout
+        self.stderr = proc.stderr
+
+
+# Set by lit.worker according to command line options (stored in Lit config)
+enableDaemonTools = False
+
+class SpecialCommandInvocation:
+    def __init__(self, stdoutContent, stderrContent, returnCode):
+        self.stdoutContent = stdoutContent
+        self.stderrContent = stderrContent
+        self.exitCode = returnCode
+
+def enqueueStderr(daemonTool):
+    while daemonTool.isAlive():
+        stderrContent = daemonTool.subprocess.stderr.readline()
+        daemonTool.stderrQueue.put(stderrContent)
+
+class LLVMDaemonTool:
+    def __init__(self, exeName, daemonCommand):
+        assert(isinstance(exeName, str))
+        assert(isinstance(daemonCommand, str))
+
+        self.exeName = exeName
+        self.daemonCommand = daemonCommand
+        self.subprocess = None
+        self.stderrQueue = Queue()
+        self.stderrQueueingThread = None
+
+    def isAlive(self):
+        if not self.subprocess:
+           return False
+        if not isinstance(self.subprocess, subprocess.Popen):
+            return False
+
+        return self.subprocess.poll() is None
+
+    def shouldReplaceInvocation(self, executableName):
+        assert(isinstance(executableName, str))
+
+        # FIXME this should just be if executableName == exeName once daemonised
+        # tools are no longer replaced with full path in substitutions when
+        # daemon tools are enabled
+        return os.path.splitext(os.path.basename(executableName))[0].lower() == self.exeName.lower()
+
+    def start(self):
+        assert(not self.isAlive())
+
+        if self.stderrQueueingThread:
+            self.stderrQueueingThread.join()
+
+        self.subprocess = subprocess.Popen(
+            self.daemonCommand,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, 
+            text=False,
+        )
+
+        self.stderrQueueingThread = Thread(target=enqueueStderr, args=[self])
+        self.stderrQueueingThread.daemon = True
+        self.stderrQueueingThread.start()
+
+    def invoke(
+        self, 
+        args,
+        stdin,
+        stdout,
+        stderr,
+        named_temp_files,
+    ):
+        if not self.isAlive():
+            self.start()
+
+        daemonCommands = []
+
+        if stdin == subprocess.PIPE:
+            pass
+        elif isinstance(stdin, str):
+            bytestr = stdin.encode()
+            bytestr = bytestr.replace(b"\r\n", b"\n")
+            daemonCommands.append(("in.bytes " + str(len(bytestr)) + "\n").encode())
+            daemonCommands.append(bytestr)
+        elif isinstance(stdin, bytes):
+            # Currently can't take binary input directly on STDIN (not sure of cross platform way to change stdin to binary)
+            try:
+                stdin.decode("utf-8", "strict")
+
+                # OK to pipe 
+                stdin = stdin.replace(b"\r\n", b"\n")
+                daemonCommands.append(("in.bytes " + str(len(stdin)) + "\n").encode())
+                daemonCommands.append(stdin)
+            except:
+                tfile = tempfile.NamedTemporaryFile(delete=False, mode="wb")
+                tfile.write(stdin)
+                tfile.close()
+
+                named_temp_files.append(tfile.name)
+                stdin = tfile
+                daemonCommands.append(("in.file " + tfile.name + "\n").encode())
+        elif isinstance(stdin.name, str): # Sometimes stdin.name is the int 10?
+            # File
+            daemonCommands.append(("in.file " + stdin.name + "\n").encode())
+
+        daemonCommands.append(("run " + " ".join(args) + "\n").encode())
+
+        self.subprocess.stdin.write(b"".join(daemonCommands))
+        self.subprocess.stdin.flush()
+
+        # Wait for daemon to finish
+
+        stdoutContent = b""
+        stderrContent = b""
+        returnCode = None
+
+        finishedMessagePrefix = b"[daemon] Task finished with code "
+
+        # If stderr and stdout are the same, we will send stdout to the same queue as stdout and 
+        # gather it from there
+        # Note this doesn't consider the case of stderr and stdout being the same named file (not a pipe),
+        # but I don't think this happens in any LLVM tests
+        stderrIsStdout = stdout == subprocess.PIPE and stderr == subprocess.STDOUT 
+
+        finishedMessageReceived = False
+        while not finishedMessageReceived:
+            # Check subprocess is still alive
+            exitCode = self.subprocess.poll()
+            if exitCode:
+                returnCode = exitCode
+                break
+
+            stdoutLine = self.subprocess.stdout.readline()
+
+            finishedMessageIndex = stdoutLine.find(finishedMessagePrefix)
+            if finishedMessageIndex >= 0: # Line contains finished message
+                finishedMessage = stdoutLine[finishedMessageIndex:]
+
+                # Chop off finished message
+                stdoutLine = stdoutLine[:finishedMessageIndex]
+
+                returnCode = int(finishedMessage.removeprefix(finishedMessagePrefix))
+                finishedMessageReceived = True
+
+            if stderrIsStdout:
+                # Make sure stdout and stderr are sent to the same queue
+                self.stderrQueue.put(stdoutLine)
+            else:
+                stdoutContent = stdoutContent + stdoutLine
+
+        # Collect stderr (and stdout if stderr is stdout) from queue 
+        # Cannot use read() as will block if nothing available
+        # Cannot use non blocking IO in Windows in Python before 3.12
+        # NB may cause issues if enqueueStderr has not finished writing at this time, not sure
+        # how to solve
+        while True:
+            try:
+                stderrLine = self.stderrQueue.get_nowait()
+                stderrContent = stderrContent + stderrLine
+            except Empty:
+                break
+
+        if stderrIsStdout:
+            stdoutContent = stderrContent 
+            stderrContent = b""
+        elif stdout != subprocess.PIPE:
+            # Stdout is a file
+            with open(stdout.name, "wb") as f:
+                f.write(stdoutContent)
+            stdoutContent = b""
+
+        return SpecialCommandInvocation(
+            stdoutContent, 
+            stderrContent,
+            returnCode,
+        )
+
+
+daemonTools = [
+    LLVMDaemonTool("FileCheck", "build/bin/FileCheck --daemon"),
+    LLVMDaemonTool("opt", "build/bin/opt --daemon"),
+]
 
 
 def _executeShCmd(cmd, shenv, results, timeoutHelper):
@@ -778,9 +967,10 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         raise ValueError("Unknown shell command: %r" % cmd.op)
     assert isinstance(cmd, ShUtil.Pipeline)
 
+    default_stdin = subprocess.PIPE
+    stderrIsStdout = False
     procs = []
     proc_not_counts = []
-    default_stdin = subprocess.PIPE
     stderrTempFiles = []
     opened_files = []
     named_temp_files = []
@@ -801,6 +991,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         "umask": executeBuiltinUmask,
         ":": executeBuiltinColon,
     }
+
     # To avoid deadlock, we use a single stderr stream for piped
     # output. This is null until we have seen some output using
     # stderr.
@@ -860,7 +1051,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         # Ensure args[0] is hashable.
         args[0] = expand_glob(args[0], cmd_shenv.cwd)[0]
 
-        # Expand all late substitutions.
+        # Expand all late substitutions
         args = _expandLateSubstitutions(j, args, cmd_shenv.cwd)
 
         inproc_builtin = inproc_builtins.get(args[0], None)
@@ -911,14 +1102,17 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             not_count = 0
         else:
             not_args = []
-
         stdin, stdout, stderr = processRedirects(
             j, default_stdin, cmd_shenv, opened_files
         )
 
+        isSpecialCommandInvocation = False
+        if enableDaemonTools:
+            isSpecialCommandInvocation = any(daemonTool.shouldReplaceInvocation(args[0]) for daemonTool in daemonTools)
+
         # If stderr wants to come from stdout, but stdout isn't a pipe, then put
         # stderr on a pipe and treat it as stdout.
-        if stderr == subprocess.STDOUT and stdout != subprocess.PIPE:
+        if not isSpecialCommandInvocation and stderr == subprocess.STDOUT and stdout != subprocess.PIPE:
             stderr = subprocess.PIPE
             stderrIsStdout = True
         else:
@@ -929,8 +1123,21 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             #
             # FIXME: This is slow, but so is deadlock.
             if stderr == subprocess.PIPE and j != cmd.commands[-1]:
-                stderr = tempfile.TemporaryFile(mode="w+b")
+                stderr = tempfile.TemporaryFile()
                 stderrTempFiles.append((i, stderr))
+
+
+        # Replace uses of /dev/null with temporary files.
+        if kAvoidDevNull:
+            for i, arg in enumerate(args):
+                if isinstance(arg, str) and kDevNull in arg:
+                    f = tempfile.NamedTemporaryFile(delete=False)
+                    f.close()
+                    named_temp_files.append(f.name)
+                    args[i] = arg.replace(kDevNull, f.name)
+
+        # Expand all glob expressions
+        args = expand_glob_expressions(args, cmd_shenv.cwd)
 
         # Resolve the executable path ourselves.
         executable = None
@@ -946,105 +1153,138 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
                 cmd_shenv.env["PATH"] if "PATH" in cmd_shenv.env else shenv.env["PATH"]
             )
             executable = lit.util.which(args[0], shenv.env["PATH"])
-        if not executable:
-            raise InternalShellError(j, "%r: command not found" % args[0])
 
-        # Replace uses of /dev/null with temporary files.
-        if kAvoidDevNull:
-            for i, arg in enumerate(args):
-                if isinstance(arg, str) and kDevNull in arg:
-                    f = tempfile.NamedTemporaryFile(delete=False)
-                    f.close()
-                    named_temp_files.append(f.name)
-                    args[i] = arg.replace(kDevNull, f.name)
+        usedDaemon = False
+        if enableDaemonTools:
+            for daemon in daemonTools:
+                if daemon.shouldReplaceInvocation(executable):
+                    # If stdin is last process's stdout, read it now
+                    if procs and isinstance(procs[-1], ProcInvocation) and stdin == procs[-1].stdout and stdin is not None:
+                        stdin = stdin.read()
 
-        # Expand all glob expressions
-        args = expand_glob_expressions(args, cmd_shenv.cwd)
+                    # Quote args
+                    def quote(arg):
+                        if " " in arg:
+                            return "\"{}\"".format(arg)
+                        return arg
+                    args = [
+                        quote(arg) for arg in args
+                    ]
 
-        # On Windows, do our own command line quoting for better compatibility
-        # with some core utility distributions.
-        if kIsWindows:
-            args = quote_windows_command(args)
+                    daemonInvocation = daemon.invoke(args, stdin, stdout, stderr, named_temp_files)
+                    stderrIsStdout = False
+                    procs.append(daemonInvocation)
+                    proc_not_counts.append(not_count)
+                    usedDaemon = True
 
-        # Handle any resource limits. We do this by launching the command with
-        # a wrapper that sets the necessary limits. We use a wrapper rather than
-        # setting the limits in process as we cannot reraise the limits back to
-        # their defaults without elevated permissions.
-        if cmd_shenv.ulimit:
-            executable = sys.executable
-            args.insert(0, sys.executable)
-            args.insert(1, os.path.join(builtin_commands_dir, "_launch_with_limit.py"))
-            for limit in cmd_shenv.ulimit:
-                cmd_shenv.env["LIT_INTERNAL_ULIMIT_" + limit] = str(
-                    cmd_shenv.ulimit[limit]
+                    if stdout == subprocess.PIPE or stderr == subprocess.STDOUT:
+                        default_stdin = daemonInvocation.stdoutContent
+                    else:
+                        default_stdin = subprocess.PIPE
+
+                    break
+        if not usedDaemon:
+            # On Windows, do our own command line quoting for better compatibility
+            # with some core utility distributions.
+            if kIsWindows:
+                args = quote_windows_command(args)
+
+            # Handle any resource limits. We do this by launching the command with
+            # a wrapper that sets the necessary limits. We use a wrapper rather than
+            # setting the limits in process as we cannot reraise the limits back to
+            # their defaults without elevated permissions.
+            if cmd_shenv.ulimit:
+                executable = sys.executable
+                args.insert(0, sys.executable)
+                args.insert(1, os.path.join(builtin_commands_dir, "_launch_with_limit.py"))
+                for limit in cmd_shenv.ulimit:
+                    cmd_shenv.env["LIT_INTERNAL_ULIMIT_" + limit] = str(
+                        cmd_shenv.ulimit[limit]
+                    )
+
+
+            if not executable:
+                raise InternalShellError(j, "%r: command not found" % args[0])
+            try:
+                # TODO(boomanaiden154): We currently wrap the subprocess.Popen with
+                # os.umask as the umask argument in subprocess.Popen is not
+                # available before Python 3.9. Once LLVM requires at least Python
+                # 3.9, this code should be updated to use umask argument.
+                old_umask = -1
+                if cmd_shenv.umask != -1:
+                    old_umask = os.umask(cmd_shenv.umask)
+                useStdin = stdin
+                useInput = None
+
+                if isinstance(stdin, str):
+                    useStdin = subprocess.PIPE
+                    useInput = stdin.encode("utf-8")
+                elif isinstance(stdin, bytes):
+                    useStdin = subprocess.PIPE
+                    useInput = stdin
+
+                procs.append(
+                    ProcInvocation(
+                        subprocess.Popen(
+                            args,
+                            cwd=cmd_shenv.cwd,
+                            executable=executable,
+                            stdin=useStdin,
+                            stdout=stdout,
+                            stderr=stderr,
+                            env=cmd_shenv.env,
+                            close_fds=kUseCloseFDs,
+                            text=False,
+                        )
+                    )
+                )
+                if useInput:
+                    procs[-1].stdin.write(useInput)
+                    procs[-1].stdin.close()
+
+                if old_umask != -1:
+                    os.umask(old_umask)
+                proc_not_counts.append(not_count)
+                # Let the helper know about this process
+                timeoutHelper.addProcess(procs[-1].proc)
+            except OSError as e:
+                raise InternalShellError(
+                    j, "Could not create process ({}) due to {}".format(executable, e)
                 )
 
-        try:
-            # TODO(boomanaiden154): We currently wrap the subprocess.Popen with
-            # os.umask as the umask argument in subprocess.Popen is not
-            # available before Python 3.9. Once LLVM requires at least Python
-            # 3.9, this code should be updated to use umask argument.
-            old_umask = -1
-            if cmd_shenv.umask != -1:
-                old_umask = os.umask(cmd_shenv.umask)
-            procs.append(
-                subprocess.Popen(
-                    args,
-                    cwd=cmd_shenv.cwd,
-                    executable=executable,
-                    stdin=stdin,
-                    stdout=stdout,
-                    stderr=stderr,
-                    env=cmd_shenv.env,
-                    close_fds=kUseCloseFDs,
-                    universal_newlines=True,
-                    errors="replace",
-                )
-            )
-            if old_umask != -1:
-                os.umask(old_umask)
-            proc_not_counts.append(not_count)
-            # Let the helper know about this process
-            timeoutHelper.addProcess(procs[-1])
-        except OSError as e:
-            raise InternalShellError(
-                j, "Could not create process ({}) due to {}".format(executable, e)
-            )
+            if stdin == subprocess.PIPE:
+                # Immediately close stdin for any process taking stdin from us.
+                procs[-1].stdin.close()
+                procs[-1].stdin = None
 
-        # Immediately close stdin for any process taking stdin from us.
-        if stdin == subprocess.PIPE:
-            procs[-1].stdin.close()
-            procs[-1].stdin = None
-
-        # Update the current stdin source.
-        if stdout == subprocess.PIPE:
-            default_stdin = procs[-1].stdout
-        elif stderrIsStdout:
-            default_stdin = procs[-1].stderr
-        else:
-            default_stdin = subprocess.PIPE
-
-    # Explicitly close any redirected files. We need to do this now because we
-    # need to release any handles we may have on the temporary files (important
-    # on Win32, for example). Since we have already spawned the subprocess, our
-    # handles have already been transferred so we do not need them anymore.
-    for (name, mode, f, path) in opened_files:
-        f.close()
+            # Update the current stdin source.
+            if stdout == subprocess.PIPE:
+                default_stdin = procs[-1].stdout
+            elif stderrIsStdout:
+                default_stdin = procs[-1].stderr
+            else:
+                default_stdin = subprocess.PIPE
 
     # FIXME: There is probably still deadlock potential here. Yawn.
     procData = [None] * len(procs)
-    procData[-1] = procs[-1].communicate()
+    if isinstance(procs[-1], ProcInvocation):
+        procData[-1] = procs[-1].proc.communicate()
+    else:
+        procData[-1] = (procs[-1].stdoutContent.decode("utf-8", "ignore"), procs[-1].stderrContent.decode("utf-8", "ignore"))
 
     for i in range(len(procs) - 1):
-        if procs[i].stdout is not None:
-            out = procs[i].stdout.read()
+        if isinstance(procs[i], ProcInvocation):
+            if procs[i].stdout is not None:
+                out = procs[i].stdout.read()
+            else:
+                out = ""
+            if procs[i].stderr is not None:
+                err = procs[i].stderr.read()
+            else:
+                err = ""
+            procData[i] = (out, err)
         else:
-            out = ""
-        if procs[i].stderr is not None:
-            err = procs[i].stderr.read()
-        else:
-            err = ""
-        procData[i] = (out, err)
+            procData[i] = (procs[i].stdoutContent.decode("utf-8", "ignore"), procs[i].stderrContent.decode("utf-8", "ignore"))
 
     # Read stderr out of the temp files.
     for i, f in stderrTempFiles:
@@ -1054,7 +1294,11 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
     exitCode = None
     for i, (out, err) in enumerate(procData):
-        res = procs[i].wait()
+        if isinstance(procs[i], ProcInvocation):
+            res = procs[i].proc.wait()
+        else:
+            res = procs[i].exitCode
+
         # Detect Ctrl-C in subprocess.
         if res == -signal.SIGINT:
             raise KeyboardInterrupt
@@ -1115,6 +1359,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             os.remove(f)
         except OSError:
             pass
+
+    # Explicitly close any redirected files. We need to do this now because we
+    # need to release any handles we may have on the temporary files (important
+    # on Win32, for example). Since we have already spawned the subprocess, our
+    # handles have already been transferred so we do not need them anymore.
+    for (name, mode, f, path) in opened_files:
+        f.close()
 
     if cmd.negate:
         exitCode = not exitCode
@@ -2419,22 +2670,6 @@ def _runShTest(test, litConfig, useExternalSh, script, tmpBase) -> lit.Test.Resu
     )
 
 
-def _expandLateSubstitutionsExternal(commandLine):
-    filePaths = []
-
-    def _replaceReadFile(match):
-        filePath = match.group(1)
-        filePaths.append(filePath)
-        return "$(cat %s)" % shlex.quote(filePath)
-
-    commandLine = re.sub(r"%{readfile:([^}]*)}", _replaceReadFile, commandLine)
-    # Add test commands before the command to check if the file exists as
-    # cat inside a subshell will never return a non-zero exit code outside
-    # of the subshell.
-    for filePath in filePaths:
-        commandLine = "%s && test -e %s" % (commandLine, filePath)
-    return commandLine
-
 def executeShTest(
     test, litConfig, useExternalSh, extra_substitutions=[], preamble_commands=[]
 ):
@@ -2464,9 +2699,5 @@ def executeShTest(
         conditions,
         recursion_limit=test.config.recursiveExpansionLimit,
     )
-
-    if useExternalSh:
-        for index, command in enumerate(script):
-            script[index] = _expandLateSubstitutionsExternal(command)
 
     return _runShTest(test, litConfig, useExternalSh, script, tmpBase)

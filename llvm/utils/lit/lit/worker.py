@@ -12,8 +12,9 @@ import time
 import traceback
 
 import lit.Test
+import lit.TestRunner
 import lit.util
-from lit.TestRunner import TestUpdaterException
+from lit.TestRunner import TestUpdaterException, enableDaemonTools
 
 
 _lit_config = None
@@ -31,6 +32,9 @@ def initialize(lit_config, parallelism_semaphores):
     # subprocesses created by the multiprocessing.Pool.
     # https://noswap.com/blog/python-multiprocessing-keyboardinterrupt
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # Set enableDaemonTools
+    lit.TestRunner.enableDaemonTools = lit_config.use_daemon_tools
 
 
 def execute(test):

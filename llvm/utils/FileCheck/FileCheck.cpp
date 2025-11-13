@@ -17,9 +17,11 @@
 
 #include "llvm/FileCheck/FileCheck.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/DaemonMode.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/SmallVectorMemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
@@ -59,9 +61,8 @@ static cl::opt<bool> NoCanonicalizeWhiteSpace(
     "strict-whitespace",
     cl::desc("Do not treat all horizontal whitespace as equivalent"));
 
-static cl::opt<bool> IgnoreCase(
-    "ignore-case",
-    cl::desc("Use case-insensitive matching"));
+static cl::opt<bool> IgnoreCase("ignore-case",
+                                cl::desc("Use case-insensitive matching"));
 
 static cl::list<std::string> ImplicitCheckNot(
     "implicit-check-not",
@@ -170,12 +171,6 @@ static cl::list<unsigned> DumpInputContexts(
              "default is 5.\n"));
 
 typedef cl::list<std::string>::const_iterator prefix_iterator;
-
-
-
-
-
-
 
 static void DumpCommandLine(int argc, char **argv) {
   errs() << "FileCheck command line: ";
@@ -617,8 +612,7 @@ static void DumpAnnotatedInput(raw_ostream &OS, const FileCheckRequest &Req,
     ElidedLinesOS.enable_colors(true);
   auto AnnotationItr = Annotations.begin(), AnnotationEnd = Annotations.end();
   for (unsigned Line = 1;
-       InputFilePtr != InputFileEnd || AnnotationItr != AnnotationEnd;
-       ++Line) {
+       InputFilePtr != InputFileEnd || AnnotationItr != AnnotationEnd; ++Line) {
     const unsigned char *InputFileLine = InputFilePtr;
 
     // Compute the previous and next line included by the filter.
@@ -695,8 +689,7 @@ static void DumpAnnotatedInput(raw_ostream &OS, const FileCheckRequest &Req,
     unsigned InputLineWidth = InputFilePtr - InputFileLine;
 
     // Print any annotations.
-    while (AnnotationItr != AnnotationEnd &&
-           AnnotationItr->InputLine == Line) {
+    while (AnnotationItr != AnnotationEnd && AnnotationItr->InputLine == Line) {
       WithColor COS(*LineOS, AnnotationItr->Marker.Color, /*Bold=*/true,
                     /*BG=*/false, TheColorMode);
       // The two spaces below are where the ": " appears on input lines.
@@ -728,12 +721,7 @@ static void DumpAnnotatedInput(raw_ostream &OS, const FileCheckRequest &Req,
   OS << ">>>>>>\n";
 }
 
-int main(int argc, char **argv) {
-  // Enable use of ANSI color codes because FileCheck is using them to
-  // highlight text.
-  llvm::sys::Process::UseANSIEscapeCodes(true);
-
-  InitLLVM X(argc, argv);
+static int run(int argc, char **argv, std::optional<DaemonInvocationContext> DIC) {
   cl::ParseCommandLineOptions(argc, argv, /*Overview*/ "", /*Errs*/ nullptr,
                               /*VFS*/ nullptr, "FILECHECK_OPTS");
 
@@ -830,16 +818,21 @@ int main(int argc, char **argv) {
     return 2;
 
   // Open the file to check and add it to SourceMgr.
-  ErrorOr<std::unique_ptr<MemoryBuffer>> InputFileOrErr =
-      MemoryBuffer::getFileOrSTDIN(InputFilename, /*IsText=*/true);
-  if (InputFilename == "-")
-    InputFilename = "<stdin>"; // Overwrite for improved diagnostic messages
-  if (std::error_code EC = InputFileOrErr.getError()) {
-    errs() << "Could not open input file '" << InputFilename
-           << "': " << EC.message() << '\n';
-    return 2;
+  std::unique_ptr<MemoryBuffer> InputBuffer;
+  if (DIC.has_value() && InputFilename == "-")  {
+    InputBuffer = MemoryBuffer::getMemBuffer(DIC.value().InputContent, "<stdin>");
+  } else {
+    auto InputFileOrErr = MemoryBuffer::getFileOrSTDIN(InputFilename, /*IsText=*/true);
+                                //
+    if (std::error_code EC = InputFileOrErr.getError()) {
+      errs() << "Could not open input file '" << InputFilename
+             << "': " << EC.message() << '\n';
+      return 2;
+    }
+
+    InputBuffer = std::move(InputFileOrErr.get());
   }
-  MemoryBuffer &InputFile = *InputFileOrErr.get();
+  auto &InputFile = *InputBuffer.get();
 
   if (InputFile.getBufferSize() == 0 && !AllowEmptyInput) {
     errs() << "FileCheck error: '" << InputFilename << "' is empty.\n";
@@ -876,4 +869,24 @@ int main(int argc, char **argv) {
   }
 
   return ExitCode;
+}
+
+int main(int argc, char **argv) {
+  // Enable use of ANSI color codes because FileCheck is using them to
+  // highlight text.
+  llvm::sys::Process::UseANSIEscapeCodes(true);
+
+  InitLLVM X(argc, argv);
+
+  // Avoid using ParseCommandLineOptions to detect --daemon
+  // TODO can't remember why
+  bool DaemonMode = false;
+  for (int i = 0; i < argc; ++i) {
+      DaemonMode = DaemonMode || StringRef(argv[i]) == "--daemon";
+  }
+
+  if (DaemonMode) {
+    return runDaemonMode(run);
+  }
+  return run(argc, argv, std::nullopt);
 }

@@ -2348,6 +2348,9 @@ bool DevirtModule::run() {
       (ImportSummary && ImportSummary->partiallySplitLTOUnits()))
     return false;
 
+  // Reset NumDevirtCalls
+  NumDevirtCalls = 0;
+
   Function *TypeTestFunc =
       Intrinsic::getDeclarationIfExists(&M, Intrinsic::type_test);
   Function *TypeCheckedLoadFunc =

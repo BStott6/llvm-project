@@ -591,13 +591,19 @@ public:
     return Value;
   }
 
-  void setValue(const DataType &V) {
+  template <class T> void setValue(const T &V) {
     Valid = true;
     Value = V;
   }
 
   // Returns whether this instance matches V.
-  bool compare(const DataType &V) const { return Valid && (Value == V); }
+  bool compare(const DataType &V) const {
+    if constexpr (std::is_class_v<DataType>) {
+      return false;
+    } else {
+      return Valid && (Value == V);
+    }
+  }
 
   bool compare(const GenericOptionValue &V) const override {
     const OptionValueCopy<DataType> &VC =
@@ -623,7 +629,9 @@ protected:
 // Top-level option class.
 template <class DataType>
 struct OptionValue final
-    : OptionValueBase<DataType, std::is_class_v<DataType>> {
+    : OptionValueBase<DataType, std::negation_v<std::conjunction<
+                                    std::is_copy_assignable<DataType>,
+                                    std::is_default_constructible<DataType>>>> {
   OptionValue() = default;
 
   OptionValue(const DataType &V) { this->setValue(V); }

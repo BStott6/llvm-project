@@ -39,10 +39,12 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Remarks/HotnessThresholdParser.h"
+#include "llvm/Support/DaemonMode.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBufferRef.h"
 #include "llvm/Support/PluginLoader.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/SystemUtils.h"
@@ -58,12 +60,16 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Debugify.h"
 #include <algorithm>
+#include <iostream>
 #include <memory>
 #include <optional>
 using namespace llvm;
 using namespace opt_tool;
 
 static codegen::RegisterCodeGenFlags CFG;
+
+static cl::opt<bool> DaemonMode("daemon", cl::desc("Run in daemon mode"),
+                                cl::init(false));
 
 // The OptimizationList is automatically populated with registered Passes by the
 // PassNameParser.
@@ -406,58 +412,12 @@ static bool shouldForceLegacyPM() {
   return false;
 }
 
-//===----------------------------------------------------------------------===//
-// main for opt
-//
-extern "C" int optMain(
-    int argc, char **argv,
+static int
+run(int argc, char **argv, std::optional<DaemonInvocationContext> DIC,
     ArrayRef<std::function<void(llvm::PassBuilder &)>> PassBuilderCallbacks) {
-  InitLLVM X(argc, argv);
 
-  // Enable debug stream buffering.
-  EnableDebugBuffering = true;
-
-  InitializeAllTargets();
-  InitializeAllTargetMCs();
-  InitializeAllAsmPrinters();
-  InitializeAllAsmParsers();
-
-  // Initialize passes
-  PassRegistry &Registry = *PassRegistry::getPassRegistry();
-  initializeCore(Registry);
-  initializeScalarOpts(Registry);
-  initializeVectorization(Registry);
-  initializeIPO(Registry);
-  initializeAnalysis(Registry);
-  initializeTransformUtils(Registry);
-  initializeInstCombine(Registry);
-  initializeTarget(Registry);
-  // For codegen passes, only passes that do IR to IR transformation are
-  // supported.
-  initializeExpandLargeDivRemLegacyPassPass(Registry);
-  initializeExpandFpLegacyPassPass(Registry);
-  initializeExpandMemCmpLegacyPassPass(Registry);
-  initializeScalarizeMaskedMemIntrinLegacyPassPass(Registry);
-  initializeSelectOptimizePass(Registry);
-  initializeCallBrPreparePass(Registry);
-  initializeCodeGenPrepareLegacyPassPass(Registry);
-  initializeAtomicExpandLegacyPass(Registry);
-  initializeWinEHPreparePass(Registry);
-  initializeDwarfEHPrepareLegacyPassPass(Registry);
-  initializeSafeStackLegacyPassPass(Registry);
-  initializeSjLjEHPreparePass(Registry);
-  initializePreISelIntrinsicLoweringLegacyPassPass(Registry);
-  initializeGlobalMergePass(Registry);
-  initializeIndirectBrExpandLegacyPassPass(Registry);
-  initializeInterleavedLoadCombinePass(Registry);
-  initializeInterleavedAccessPass(Registry);
-  initializePostInlineEntryExitInstrumenterPass(Registry);
-  initializeUnreachableBlockElimLegacyPassPass(Registry);
-  initializeExpandReductionsPass(Registry);
-  initializeWasmEHPreparePass(Registry);
-  initializeWriteBitcodePassPass(Registry);
-  initializeReplaceWithVeclibLegacyPass(Registry);
-  initializeJMCInstrumenterPass(Registry);
+  cl::ParseCommandLineOptions(
+      argc, argv, "llvm .bc -> .bc modular optimizer and analysis printer\n");
 
   SmallVector<PassPlugin, 1> PluginList;
   PassPlugins.setCallback([&](const std::string &PluginPath) {
@@ -466,12 +426,6 @@ extern "C" int optMain(
       reportFatalUsageError(Plugin.takeError());
     PluginList.emplace_back(Plugin.get());
   });
-
-  // Register the Target and CPU printer for --version.
-  cl::AddExtraVersionPrinter(sys::printDefaultTargetAndDetectedCPU);
-
-  cl::ParseCommandLineOptions(
-      argc, argv, "llvm .bc -> .bc modular optimizer and analysis printer\n");
 
   LLVMContext Context;
 
@@ -553,13 +507,24 @@ extern "C" int optMain(
     return (*ExpectedTM)->createDataLayout().getStringRepresentation();
   };
   std::unique_ptr<Module> M;
-  if (NoUpgradeDebugInfo)
-    M = parseAssemblyFileWithIndexNoUpgradeDebugInfo(
-            InputFilename, Err, Context, nullptr, SetDataLayout)
-            .Mod;
-  else
-    M = parseIRFile(InputFilename, Err, Context,
-                    ParserCallbacks(SetDataLayout));
+
+  if (DIC.has_value() && InputFilename == "-") {
+    // FIXME Make equivalent of `parseAssemblyFileWithIndexNoUpgradeDebugInfo`
+    // that takes IR string directly
+    assert(!NoUpgradeDebugInfo &&
+           "Cannot use NoUpgradeDebugInfo with daemon mode");
+
+    M = parseIR(MemoryBufferRef(DIC.value().InputContent, "<stdin>"), Err,
+                Context, ParserCallbacks(SetDataLayout));
+  } else {
+    if (NoUpgradeDebugInfo)
+      M = parseAssemblyFileWithIndexNoUpgradeDebugInfo(
+              InputFilename, Err, Context, nullptr, SetDataLayout)
+              .Mod;
+    else
+      M = parseIRFile(InputFilename, Err, Context,
+                      ParserCallbacks(SetDataLayout));
+  }
 
   if (!M) {
     Err.print(argv[0], errs());
@@ -935,4 +900,76 @@ extern "C" int optMain(
     ThinLinkOut->keep();
 
   return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// main for opt
+//
+extern "C" int optMain(
+    int argc, char **argv,
+    ArrayRef<std::function<void(llvm::PassBuilder &)>> PassBuilderCallbacks) {
+  InitLLVM X(argc, argv);
+
+  // Enable debug stream buffering.
+  EnableDebugBuffering = true;
+
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmPrinters();
+  InitializeAllAsmParsers();
+
+  // Initialize passes
+  PassRegistry &Registry = *PassRegistry::getPassRegistry();
+  initializeCore(Registry);
+  initializeScalarOpts(Registry);
+  initializeVectorization(Registry);
+  initializeIPO(Registry);
+  initializeAnalysis(Registry);
+  initializeTransformUtils(Registry);
+  initializeInstCombine(Registry);
+  initializeTarget(Registry);
+  // For codegen passes, only passes that do IR to IR transformation are
+  // supported.
+  initializeExpandLargeDivRemLegacyPassPass(Registry);
+  initializeExpandFpLegacyPassPass(Registry);
+  initializeExpandMemCmpLegacyPassPass(Registry);
+  initializeScalarizeMaskedMemIntrinLegacyPassPass(Registry);
+  initializeSelectOptimizePass(Registry);
+  initializeCallBrPreparePass(Registry);
+  initializeCodeGenPrepareLegacyPassPass(Registry);
+  initializeAtomicExpandLegacyPass(Registry);
+  initializeWinEHPreparePass(Registry);
+  initializeDwarfEHPrepareLegacyPassPass(Registry);
+  initializeSafeStackLegacyPassPass(Registry);
+  initializeSjLjEHPreparePass(Registry);
+  initializePreISelIntrinsicLoweringLegacyPassPass(Registry);
+  initializeGlobalMergePass(Registry);
+  initializeIndirectBrExpandLegacyPassPass(Registry);
+  initializeInterleavedLoadCombinePass(Registry);
+  initializeInterleavedAccessPass(Registry);
+  initializePostInlineEntryExitInstrumenterPass(Registry);
+  initializeUnreachableBlockElimLegacyPassPass(Registry);
+  initializeExpandReductionsPass(Registry);
+  initializeWasmEHPreparePass(Registry);
+  initializeWriteBitcodePassPass(Registry);
+  initializeReplaceWithVeclibLegacyPass(Registry);
+  initializeJMCInstrumenterPass(Registry);
+
+  // Register the Target and CPU printer for --version.
+  cl::AddExtraVersionPrinter(sys::printDefaultTargetAndDetectedCPU);
+
+  // Avoid using ParseCommandLineOptions to detect --daemon
+  // TODO can't remember why
+  bool DaemonMode = false;
+  for (int i = 0; i < argc; ++i) {
+    DaemonMode = DaemonMode || StringRef(argv[i]) == "--daemon";
+  }
+
+  if (DaemonMode) {
+    return runDaemonMode(
+        [&](int argc, char **argv, DaemonInvocationContext DIC) {
+          return run(argc, argv, DIC, PassBuilderCallbacks);
+        });
+  }
+  return run(argc, argv, std::nullopt, PassBuilderCallbacks);
 }
