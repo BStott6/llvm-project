@@ -44,6 +44,7 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include <algorithm>
 #include <optional>
 using namespace clang;
 using namespace CodeGen;
@@ -1398,7 +1399,8 @@ static llvm::Value *CreateCoercedLoad(Address Src, llvm::Type *Ty,
 
 void CodeGenFunction::CreateCoercedStore(llvm::Value *Src, Address Dst,
                                          llvm::TypeSize DstSize,
-                                         bool DstIsVolatile) {
+                                         bool DstIsVolatile,
+                                         std::optional<QualType> QTy) {
   if (!DstSize)
     return;
 
@@ -1433,6 +1435,19 @@ void CodeGenFunction::CreateCoercedStore(llvm::Value *Src, Address Dst,
         llvm::Value *Elt = Builder.CreateExtractValue(Src, i);
         auto *I = Builder.CreateStore(Elt, EltPtr, DstIsVolatile);
         addInstToCurrentSourceAtom(I, Elt);
+
+        if (QTy) {
+          auto LValue = LValue::MakeAddr(EltPtr, *QTy, getContext(),
+                                         LValueBaseInfo(AlignmentSource::Type),
+                                         TBAAAccessInfo());
+          auto *RecordDecl = (*QTy)->getAsRecordDecl();
+          FieldDecl *FieldDecl =
+              std::next(RecordDecl->field_begin(), i)->getCanonicalDecl();
+          auto TBAAInfo =
+              CGM.getTBAAInfoForField(LValue, RecordDecl, FieldDecl);
+
+          CGM.DecorateInstructionWithTBAA(I, TBAAInfo);
+        }
       }
     } else {
       auto *I =
@@ -6235,9 +6250,8 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
           CreateCoercedStore(
               CI, StorePtr,
               llvm::TypeSize::getFixed(DestSize - RetAI.getDirectOffset()),
-              DestIsVolatile);
+              DestIsVolatile, RetTy);
         }
-
         return convertTempToRValue(DestPtr, RetTy, SourceLocation());
       }
 

@@ -1720,6 +1720,52 @@ CodeGenModule::mergeTBAAInfoForMemoryTransfer(TBAAAccessInfo DestInfo,
   return TBAA->mergeTBAAInfoForConditionalOperator(DestInfo, SrcInfo);
 }
 
+TBAAAccessInfo CodeGenModule::getTBAAInfoForField(LValue Base,
+                                                  const RecordDecl *Rec,
+                                                  const FieldDecl *Field) {
+  // Fields of may-alias structures are may-alias themselves.
+  // FIXME: this should get propagated down through anonymous structs
+  // and unions.
+
+  LValueBaseInfo BaseInfo = Base.getBaseInfo();
+
+  QualType FieldType = Field->getType();
+  AlignmentSource BaseAlignSource = BaseInfo.getAlignmentSource();
+  LValueBaseInfo FieldBaseInfo(getFieldAlignmentSource(BaseAlignSource));
+  TBAAAccessInfo FieldTBAAInfo;
+  if (Base.getTBAAInfo().isMayAlias() || Rec->hasAttr<MayAliasAttr>() ||
+      FieldType->isVectorType()) {
+    FieldTBAAInfo = TBAAAccessInfo::getMayAliasInfo();
+  } else if (Rec->isUnion()) {
+    // TODO: Support TBAA for unions.
+    FieldTBAAInfo = TBAAAccessInfo::getMayAliasInfo();
+  } else {
+    // If no base type been assigned for the base access, then try to generate
+    // one for this base lvalue.
+    FieldTBAAInfo = Base.getTBAAInfo();
+    if (!FieldTBAAInfo.BaseType) {
+      FieldTBAAInfo.BaseType = getTBAABaseTypeInfo(Base.getType());
+      assert(!FieldTBAAInfo.Offset &&
+             "Nonzero offset for an access with no base type!");
+    }
+
+    // Adjust offset to be relative to the base type.
+    const ASTRecordLayout &Layout =
+        getContext().getASTRecordLayout(Field->getParent());
+    unsigned CharWidth = getContext().getCharWidth();
+    if (FieldTBAAInfo.BaseType)
+      FieldTBAAInfo.Offset +=
+          Layout.getFieldOffset(Field->getFieldIndex()) / CharWidth;
+
+    // Update the final access type and size.
+    FieldTBAAInfo.AccessType = getTBAATypeInfo(FieldType);
+    FieldTBAAInfo.Size =
+        getContext().getTypeSizeInChars(FieldType).getQuantity();
+  }
+
+  return FieldTBAAInfo;
+}
+
 void CodeGenModule::DecorateInstructionWithTBAA(llvm::Instruction *Inst,
                                                 TBAAAccessInfo TBAAInfo) {
   if (llvm::MDNode *Tag = getTBAAAccessTagInfo(TBAAInfo))
