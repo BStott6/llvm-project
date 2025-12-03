@@ -51,6 +51,42 @@ using namespace CodeGen;
 
 /***/
 
+namespace {
+/// Creates a table of `FieldDecl` pointers for each `llvm::StructTy` element
+/// no, by working backwards from the `CGRecordLayout`.
+class LLVMToClangFieldLookup {
+public:
+  LLVMToClangFieldLookup(const llvm::StructType *LLVMType,
+                         const RecordDecl *RDecl, const CGRecordLayout &RLayout)
+      : Table(LLVMType->getNumElements(), nullptr) {
+    for (const auto *FDecl : RDecl->fields()) {
+      if (!isa<FieldDecl>(FDecl))
+        continue;
+      if (!RLayout.containsFieldDecl(FDecl))
+        continue;
+
+      unsigned FieldIndex = RLayout.getLLVMFieldNo(FDecl);
+      assert(FieldIndex < Table.size() &&
+             "Field index should not exceed num elements");
+
+      if (!Table[FieldIndex]) {
+        // If several LLVM fields correspond to the same Clang FieldDecl,
+        // arbitrarily pick the first.
+        Table[FieldIndex] = FDecl;
+      }
+    }
+  }
+
+  const FieldDecl *getFieldDeclForFieldNo(unsigned FieldNo) {
+    assert(FieldNo < Table.size());
+    return Table[FieldNo];
+  }
+
+private:
+  SmallVector<const FieldDecl *, 16> Table;
+};
+} // namespace
+
 unsigned CodeGenTypes::ClangCallConvToLLVMCallConv(CallingConv CC) {
   switch (CC) {
   default:
@@ -1428,6 +1464,16 @@ void CodeGenFunction::CreateCoercedStore(llvm::Value *Src, Address Dst,
       addInstToCurrentSourceAtom(I, Src);
     } else if (llvm::StructType *STy =
                    dyn_cast<llvm::StructType>(Src->getType())) {
+      // For TBAA metadata, get the record layout
+      std::optional<LLVMToClangFieldLookup> FieldLookupForTBAA;
+      if (QTy && CGM.shouldUseTBAA()) {
+        if (const RecordDecl *RDecl = (*QTy)->getAsRecordDecl()) {
+          const CGRecordLayout &RLayout =
+              CGM.getTypes().getCGRecordLayout(RDecl);
+          FieldLookupForTBAA.emplace(STy, RDecl, RLayout);
+        }
+      }
+
       // Prefer scalar stores to first-class aggregate stores.
       Dst = Dst.withElementType(SrcTy);
       for (unsigned i = 0, e = STy->getNumElements(); i != e; ++i) {
@@ -1436,17 +1482,20 @@ void CodeGenFunction::CreateCoercedStore(llvm::Value *Src, Address Dst,
         auto *I = Builder.CreateStore(Elt, EltPtr, DstIsVolatile);
         addInstToCurrentSourceAtom(I, Elt);
 
-        if (QTy) {
-          auto LValue = LValue::MakeAddr(EltPtr, *QTy, getContext(),
-                                         LValueBaseInfo(AlignmentSource::Type),
-                                         TBAAAccessInfo());
-          auto *RecordDecl = (*QTy)->getAsRecordDecl();
-          FieldDecl *FieldDecl =
-              std::next(RecordDecl->field_begin(), i)->getCanonicalDecl();
-          auto TBAAInfo =
-              CGM.getTBAAInfoForField(LValue, RecordDecl, FieldDecl);
+        if (FieldLookupForTBAA) {
+          const auto LValue = LValue::MakeAddr(
+              EltPtr, *QTy, getContext(), LValueBaseInfo(AlignmentSource::Type),
+              TBAAAccessInfo());
+          // Try to find the field declaration corresponding to this struct
+          // element no.
+          const FieldDecl *FDecl =
+              FieldLookupForTBAA->getFieldDeclForFieldNo(i);
 
-          CGM.DecorateInstructionWithTBAA(I, TBAAInfo);
+          if (FDecl) {
+            CGM.DecorateInstructionWithTBAA(
+                I, CGM.getTBAAInfoForField(LValue, (*QTy)->getAsRecordDecl(),
+                                           FDecl));
+          }
         }
       }
     } else {
