@@ -850,7 +850,7 @@ bool TypeSanitizer::instrumentMemInst(Value *V, Instruction *ShadowBase,
       IP = AppMemMask->getNextNode()->getIterator();
   }
 
-  Value *Dest, *Size, *Src = nullptr;
+  Value *Dest, *Size = nullptr;
   bool NeedsMemMove = false;
   IRBuilder<> IRB(BB, IP);
 
@@ -875,13 +875,6 @@ bool TypeSanitizer::instrumentMemInst(Value *V, Instruction *ShadowBase,
 
       Dest = MI->getDest();
       Size = MI->getLength();
-
-      if (auto *MTI = dyn_cast<MemTransferInst>(MI)) {
-        if (MTI->getSourceAddressSpace() == 0) {
-          Src = MTI->getSource();
-          NeedsMemMove = isa<MemMoveInst>(MTI);
-        }
-      }
     } else if (auto *II = dyn_cast<LifetimeIntrinsic>(I)) {
       auto *AI = dyn_cast<AllocaInst>(II->getArgOperand(0));
       if (!AI)
@@ -904,12 +897,9 @@ bool TypeSanitizer::instrumentMemInst(Value *V, Instruction *ShadowBase,
   }
 
   if (ClOutlineInstrumentation) {
-    if (!Src)
-      Src = ConstantPointerNull::get(IRB.getPtrTy());
-
-    IRB.CreateCall(
-        TysanIntrumentMemInst,
-        {Dest, Src, Size, NeedsMemMove ? IRB.getTrue() : IRB.getFalse()});
+    IRB.CreateCall(TysanIntrumentMemInst,
+                   {Dest, ConstantPointerNull::get(IRB.getPtrTy()), Size,
+                    NeedsMemMove ? IRB.getTrue() : IRB.getFalse()});
     return true;
   } else {
     if (!ShadowBase)
@@ -924,26 +914,9 @@ bool TypeSanitizer::instrumentMemInst(Value *V, Instruction *ShadowBase,
         ShadowBase);
     Value *ShadowData = IRB.CreateIntToPtr(ShadowDataInt, IRB.getPtrTy());
 
-    if (!Src) {
-      IRB.CreateMemSet(ShadowData, IRB.getInt8(0),
-                       IRB.CreateShl(Size, PtrShift), Align(1ull << PtrShift));
-      return true;
-    }
-
-    Value *SrcShadowDataInt = IRB.CreateAdd(
-        IRB.CreateShl(
-            IRB.CreateAnd(IRB.CreatePtrToInt(Src, IntptrTy), AppMemMask),
-            PtrShift),
-        ShadowBase);
-    Value *SrcShadowData = IRB.CreateIntToPtr(SrcShadowDataInt, IRB.getPtrTy());
-
-    if (NeedsMemMove) {
-      IRB.CreateMemMove(ShadowData, Align(1ull << PtrShift), SrcShadowData,
-                        Align(1ull << PtrShift), IRB.CreateShl(Size, PtrShift));
-    } else {
-      IRB.CreateMemCpy(ShadowData, Align(1ull << PtrShift), SrcShadowData,
-                       Align(1ull << PtrShift), IRB.CreateShl(Size, PtrShift));
-    }
+    IRB.CreateMemSet(ShadowData, IRB.getInt8(0), IRB.CreateShl(Size, PtrShift),
+                     Align(1ull << PtrShift));
+    return true;
   }
 
   return true;
