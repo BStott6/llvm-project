@@ -2363,8 +2363,17 @@ void CodeGenFunction::EmitAggregateCopy(LValue Dest, LValue Src, QualType Ty,
   // Determine the metadata to describe the position of any padding in this
   // memcpy, as well as the TBAA tags for the members of the struct, in case
   // the optimizer wishes to expand it in to scalar memory operations.
-  if (llvm::MDNode *TBAAStructTag = CGM.getTBAAStructInfo(Ty))
+  if (llvm::MDNode *TBAAStructTag = CGM.getTBAAStructInfo(Ty)) {
     Inst->setMetadata(llvm::LLVMContext::MD_tbaa_struct, TBAAStructTag);
+
+    // Attach base type metadata for Type Sanitizer, if enabled.
+    if (CGM.getLangOpts().Sanitize.has(SanitizerKind::Type)) {
+      if (llvm::MDNode *TBAABaseTypeTag = CGM.getTBAABaseTypeInfo(Ty)) {
+        Inst->setMetadata(llvm::LLVMContext::MD_tysan_base_type_tbaa,
+                          TBAABaseTypeTag);
+      }
+    }
+  }
 
   if (CGM.getCodeGenOpts().NewStructPathTBAA) {
     TBAAAccessInfo TBAAInfo = CGM.mergeTBAAInfoForMemoryTransfer(

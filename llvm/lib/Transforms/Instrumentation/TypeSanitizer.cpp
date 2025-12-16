@@ -953,7 +953,13 @@ bool TypeSanitizer::instrumentMemIntrinsWithTBAAStructMD(
     TypeDescriptorsMapTy &TypeDescriptors, TypeNameMapTy &TypeNames,
     Module &M) {
   IRBuilder<> IRB(I->getParent(), BasicBlock::iterator(I));
+  MDBuilder MDB(IRB.getContext());
   unsigned FieldCount = TBAAStructMD->getNumOperands() / 3;
+
+  // Look for tysan.base_type_tbaa metadata, which is added to communicate the
+  // base type name alongside the tbaa.struct metadata. This allows TySan to
+  // display the base type of a field access as usual.
+  MDNode *BaseTypeNode = I->getMetadata(LLVMContext::MD_tysan_base_type_tbaa);
 
   for (unsigned FieldIndex = 0; FieldIndex < FieldCount; ++FieldIndex) {
     unsigned FieldOffset = mdconst::extract<ConstantInt>(
@@ -964,11 +970,19 @@ bool TypeSanitizer::instrumentMemIntrinsWithTBAAStructMD(
                              TBAAStructMD->getOperand(FieldIndex * 3 + 1).get())
                              ->getValue()
                              .getLimitedValue(UINT32_MAX);
-    const MDNode *FieldNode =
+    MDNode *FieldAccessTag =
         cast<MDNode>(TBAAStructMD->getOperand(FieldIndex * 3 + 2));
 
-    if (TypeDescriptors.contains(FieldNode) ||
-        generateTypeDescriptor(FieldNode, TypeDescriptors, TypeNames, M)) {
+    if (BaseTypeNode) {
+      MDNode *FieldScalarType = cast<MDNode>(FieldAccessTag->getOperand(1));
+      if (MDNode *NewAccessTag = MDB.createTBAAStructTagNode(
+              +BaseTypeNode, FieldScalarType, FieldOffset, FieldSize)) {
+        FieldAccessTag = NewAccessTag;
+      }
+    }
+
+    if (TypeDescriptors.contains(FieldAccessTag) ||
+        generateTypeDescriptor(FieldAccessTag, TypeDescriptors, TypeNames, M)) {
       // Add the field offset to the destination.
       Value *Dest = I->getDest();
       if (FieldOffset != 0) {
@@ -977,9 +991,9 @@ bool TypeSanitizer::instrumentMemIntrinsWithTBAAStructMD(
         Dest = IRB.CreateIntToPtr(WithOffset, IRB.getPtrTy());
       }
 
-      instrumentWithShadowUpdate(IRB, FieldNode, Dest, FieldSize, false, false,
-                                 ShadowBase, AppMemMask, true, SanitizeFunction,
-                                 TypeDescriptors, DL);
+      instrumentWithShadowUpdate(IRB, FieldAccessTag, Dest, FieldSize, false,
+                                 false, ShadowBase, AppMemMask, true,
+                                 SanitizeFunction, TypeDescriptors, DL);
     }
   }
 

@@ -22,11 +22,11 @@ int main(void) {
   struct S b = a;
   *(float *)&b.x = 1.0f;
   // CHECK: ERROR: TypeSanitizer: type-aliasing-violation
-  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type long
+  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type long (in S at offset 0)
   // CHECK: {{#0 0x.* in main .*struct-copy.c:}}[[@LINE-3]]
   *(float *)&b.y = 1.0f;
   // CHECK: ERROR: TypeSanitizer: type-aliasing-violation
-  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type short
+  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type short (in S at offset 8)
   // CHECK: {{#0 0x.* in main .*struct-copy.c:}}[[@LINE-3]]
 
   struct Nested n;
@@ -39,18 +39,18 @@ int main(void) {
 
   *(float *)&m.z = 1.0f;
   // CHECK: ERROR: TypeSanitizer: type-aliasing-violation
-  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type int
+  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type int (in Nested at offset 0)
   // CHECK: {{#0 0x.* in main .*struct-copy.c:}}[[@LINE-3]]
   *(float *)&m.inner.x = 1.0f;
   // CHECK: ERROR: TypeSanitizer: type-aliasing-violation
-  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type long
+  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type long (in Nested at offset 8)
   // CHECK: {{#0 0x.* in main .*struct-copy.c:}}[[@LINE-3]]
   *(float *)&m.inner.y = 1.0f;
   // CHECK: ERROR: TypeSanitizer: type-aliasing-violation
-  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type short
+  // CHECK: WRITE of size 4 at {{.*}} with type float accesses an existing object of type short (in Nested at offset 16)
   // CHECK: {{#0 0x.* in main .*struct-copy.c:}}[[@LINE-3]]
   *(int *)&m.w = 3;
   // CHECK: ERROR: TypeSanitizer: type-aliasing-violation
-  // CHECK: WRITE of size 4 at {{.*}} with type int accesses an existing object of type float
+  // CHECK: WRITE of size 4 at {{.*}} with type int accesses an existing object of type float (in Nested at offset 24)
   // CHECK: {{#0 0x.* in main .*struct-copy.c:}}[[@LINE-3]]
 }
