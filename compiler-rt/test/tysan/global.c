@@ -9,7 +9,7 @@ int main(void) {
   // CHECK: WRITE of size 4 at {{.*}} with type int accesses an existing object of type float
   // CHECK: {{#0 0x.* in main .*global.c:}}[[@LINE-3]]
 
-  int r = *(((int *)L) + 1);
+  int r = *(((int *)&L) + 1);
   // CHECK: ERROR: TypeSanitizer: type-aliasing-violation
   // CHECK: READ of size 4 at {{.*}} with type int accesses part of an existing object of type long that starts at offset -4
   // CHECK: {{#0 0x.* in main .*global.c:}}[[@LINE-3]]
