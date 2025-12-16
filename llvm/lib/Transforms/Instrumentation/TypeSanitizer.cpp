@@ -102,7 +102,18 @@ private:
   /// Memory-related intrinsics/instructions reset the type of the destination
   /// memory (including allocas and byval arguments).
   bool instrumentMemInst(Value *I, Instruction *ShadowBase,
-                         Instruction *AppMemMask, const DataLayout &DL);
+                         Instruction *AppMemMask, const DataLayout &DL,
+                         bool SanitizeFunction,
+                         TypeDescriptorsMapTy &TypeDescriptors,
+                         TypeNameMapTy &TypeNames, Module &M);
+
+  /// Instrument memcpy/memmove intrinsics, updating the shadow types based
+  /// on attached tbaa.struct metadata.
+  bool instrumentMemIntrinsWithTBAAStructMD(
+      MemTransferInst *I, MDNode *TBAAStructMD, Instruction *ShadowBase,
+      Instruction *AppMemMask, const DataLayout &DL, bool SanitizeFunction,
+      TypeDescriptorsMapTy &TypeDescriptors, TypeNameMapTy &TypeNames,
+      Module &M);
 
   std::string getAnonymousStructIdentifier(const MDNode *MD,
                                            TypeNameMapTy &TypeNames);
@@ -599,8 +610,10 @@ bool TypeSanitizer::sanitizeFunction(Function &F,
     }
   }
 
-  for (auto Inst : MemTypeResetInsts)
-    Res |= instrumentMemInst(Inst, ShadowBase, AppMemMask, DL);
+  for (auto *Inst : MemTypeResetInsts) {
+    Res |= instrumentMemInst(Inst, ShadowBase, AppMemMask, DL, SanitizeFunction,
+                             TypeDescriptors, TypeNames, M);
+  }
 
   return Res;
 }
@@ -828,7 +841,10 @@ bool TypeSanitizer::instrumentWithShadowUpdate(
 
 bool TypeSanitizer::instrumentMemInst(Value *V, Instruction *ShadowBase,
                                       Instruction *AppMemMask,
-                                      const DataLayout &DL) {
+                                      const DataLayout &DL,
+                                      bool SanitizeFunction,
+                                      TypeDescriptorsMapTy &TypeDescriptors,
+                                      TypeNameMapTy &TypeNames, Module &M) {
   BasicBlock::iterator IP;
   BasicBlock *BB;
   Function *F;
@@ -875,6 +891,15 @@ bool TypeSanitizer::instrumentMemInst(Value *V, Instruction *ShadowBase,
 
       Dest = MI->getDest();
       Size = MI->getLength();
+
+      if (auto *MTI = dyn_cast<MemTransferInst>(I)) {
+        if (MDNode *TBAAStructMD =
+                MTI->getMetadata(LLVMContext::MD_tbaa_struct)) {
+          return instrumentMemIntrinsWithTBAAStructMD(
+              MTI, TBAAStructMD, ShadowBase, AppMemMask, DL, SanitizeFunction,
+              TypeDescriptors, TypeNames, M);
+        }
+      }
     } else if (auto *II = dyn_cast<LifetimeIntrinsic>(I)) {
       auto *AI = dyn_cast<AllocaInst>(II->getArgOperand(0));
       if (!AI)
@@ -922,6 +947,45 @@ bool TypeSanitizer::instrumentMemInst(Value *V, Instruction *ShadowBase,
   return true;
 }
 
+bool TypeSanitizer::instrumentMemIntrinsWithTBAAStructMD(
+    MemTransferInst *I, MDNode *TBAAStructMD, Instruction *ShadowBase,
+    Instruction *AppMemMask, const DataLayout &DL, bool SanitizeFunction,
+    TypeDescriptorsMapTy &TypeDescriptors, TypeNameMapTy &TypeNames,
+    Module &M) {
+  IRBuilder<> IRB(I->getParent(), BasicBlock::iterator(I));
+  unsigned FieldCount = TBAAStructMD->getNumOperands() / 3;
+
+  for (unsigned FieldIndex = 0; FieldIndex < FieldCount; ++FieldIndex) {
+    unsigned FieldOffset = mdconst::extract<ConstantInt>(
+                               TBAAStructMD->getOperand(FieldIndex * 3).get())
+                               ->getValue()
+                               .getLimitedValue(UINT32_MAX);
+    unsigned FieldSize = mdconst::extract<ConstantInt>(
+                             TBAAStructMD->getOperand(FieldIndex * 3 + 1).get())
+                             ->getValue()
+                             .getLimitedValue(UINT32_MAX);
+    const MDNode *FieldNode =
+        cast<MDNode>(TBAAStructMD->getOperand(FieldIndex * 3 + 2));
+
+    if (TypeDescriptors.contains(FieldNode) ||
+        generateTypeDescriptor(FieldNode, TypeDescriptors, TypeNames, M)) {
+      // Add the field offset to the destination.
+      Value *Dest = I->getDest();
+      if (FieldOffset != 0) {
+        auto *AsInt = IRB.CreatePtrToInt(I->getDest(), IntptrTy);
+        auto *WithOffset = IRB.CreateAdd(AsInt, IRB.getInt64(FieldOffset));
+        Dest = IRB.CreateIntToPtr(WithOffset, IRB.getPtrTy());
+      }
+
+      instrumentWithShadowUpdate(IRB, FieldNode, Dest, FieldSize, false, false,
+                                 ShadowBase, AppMemMask, true, SanitizeFunction,
+                                 TypeDescriptors, DL);
+    }
+  }
+
+  return true;
+}
+
 PreservedAnalyses TypeSanitizerPass::run(Module &M,
                                          ModuleAnalysisManager &MAM) {
   Function *TysanCtorFunction;
@@ -951,4 +1015,10 @@ PreservedAnalyses TypeSanitizerPass::run(Module &M,
   }
 
   return PreservedAnalyses::none();
+  bool instrumentMemIntrinsWithTBAAStructMD(
+      MemTransferInst * I, MDNode * TBAAStructMD, Instruction * ShadowBase,
+      Instruction * AppMemMask, const DataLayout &DL);
+  bool instrumentMemIntrinsWithTBAAStructMD(
+      MemTransferInst * I, MDNode * TBAAStructMD, Instruction * ShadowBase,
+      Instruction * AppMemMask, const DataLayout &DL);
 }

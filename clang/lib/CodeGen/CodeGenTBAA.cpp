@@ -496,7 +496,10 @@ CodeGenTBAA::CollectFields(uint64_t BaseOffset,
 
 llvm::MDNode *
 CodeGenTBAA::getTBAAStructInfo(QualType QTy) {
-  if (CodeGenOpts.OptimizationLevel == 0 || CodeGenOpts.RelaxedAliasing)
+  // At -O0 or relaxed aliasing, TBAA is not emitted for regular types (unless
+  // we're running TypeSanitizer).
+  if (!Features.Sanitize.has(SanitizerKind::Type) &&
+      (CodeGenOpts.OptimizationLevel == 0 || CodeGenOpts.RelaxedAliasing))
     return nullptr;
 
   const Type *Ty = Context.getCanonicalType(QTy).getTypePtr();
