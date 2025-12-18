@@ -137,6 +137,7 @@ private:
   FunctionCallee TysanIntrumentMemInst;
   FunctionCallee TysanInstrumentWithShadowUpdate;
   FunctionCallee TysanSetShadowType;
+  FunctionCallee TysanSetFieldShadowType;
 
   /// Callback to set types for gloabls.
   Function *TysanGlobalsSetTypeFunction;
@@ -196,6 +197,14 @@ void TypeSanitizer::initializeCallbacks(Module &M) {
       IRB.getPtrTy(), // Pointer of data to be written to
       IRB.getPtrTy(), // Pointer to the new type descriptor
       U64Ty           // Size of data we access in bytes
+  );
+
+  TysanSetFieldShadowType = M.getOrInsertFunction(
+      "__tysan_set_field_shadow_type", Attr, IRB.getVoidTy(),
+      IRB.getPtrTy(), // Pointer to the aggregate object (e.g. memcpy dest)
+      IRB.getPtrTy(), // Pointer to the new type desriptor
+      U64Ty,          // Size of the field in bytes
+      U64Ty           // Offset of the field from the first arg, in bytes
   );
 }
 
@@ -983,17 +992,25 @@ bool TypeSanitizer::instrumentMemIntrinsWithTBAAStructMD(
 
     if (TypeDescriptors.contains(FieldAccessTag) ||
         generateTypeDescriptor(FieldAccessTag, TypeDescriptors, TypeNames, M)) {
-      // Add the field offset to the destination.
-      Value *Dest = I->getDest();
-      if (FieldOffset != 0) {
-        auto *AsInt = IRB.CreatePtrToInt(I->getDest(), IntptrTy);
-        auto *WithOffset = IRB.CreateAdd(AsInt, IRB.getInt64(FieldOffset));
-        Dest = IRB.CreateIntToPtr(WithOffset, IRB.getPtrTy());
-      }
+      if (ClOutlineInstrumentation) {
+        GlobalValue *TDGV = TDGV = TypeDescriptors[FieldAccessTag];
+        Value *TD = IRB.CreateBitCast(TDGV, IRB.getPtrTy());
+        IRB.CreateCall(TysanSetFieldShadowType,
+                       {I->getDest(), TD, IRB.getInt64(FieldSize),
+                        IRB.getInt64(FieldOffset)});
+      } else {
+        // Add the field offset to the destination.
+        Value *Dest = I->getDest();
+        if (FieldOffset != 0) {
+          auto *AsInt = IRB.CreatePtrToInt(I->getDest(), IntptrTy);
+          auto *WithOffset = IRB.CreateAdd(AsInt, IRB.getInt64(FieldOffset));
+          Dest = IRB.CreateIntToPtr(WithOffset, IRB.getPtrTy());
+        }
 
-      instrumentWithShadowUpdate(IRB, FieldAccessTag, Dest, FieldSize, false,
-                                 false, ShadowBase, AppMemMask, true,
-                                 SanitizeFunction, TypeDescriptors, DL);
+        instrumentWithShadowUpdate(IRB, FieldAccessTag, Dest, FieldSize, false,
+                                   false, ShadowBase, AppMemMask, true,
+                                   SanitizeFunction, TypeDescriptors, DL);
+      }
     }
   }
 

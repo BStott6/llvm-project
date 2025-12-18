@@ -417,6 +417,14 @@ __tysan_set_shadow_type(void *ptr, tysan_type_descriptor *td,
   SetShadowType(td, shadow, accessSize);
 }
 
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__tysan_set_field_shadow_type(void *base_ptr, tysan_type_descriptor *field_td,
+                              uint64_t field_size, uint64_t field_offset) {
+  // Add field offset to base pointer.
+  void *field_ptr = (void *) (((uptr) base_ptr) + field_offset);
+  __tysan_set_shadow_type(field_ptr, field_td, field_size);
+}
+
 Flags __tysan::flags_data;
 
 SANITIZER_INTERFACE_ATTRIBUTE uptr __tysan_shadow_memory_address;
