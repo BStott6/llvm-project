@@ -3,7 +3,7 @@ import os
 import pathlib
 import shutil
 import stat
-from typing import Callable
+from typing import Any, Callable
 
 import lit.util
 from lit.ShCommands import Command
@@ -15,6 +15,10 @@ class InprocBuiltinIO:
     Holds IO streams for an inproc builtin invocation.
     These may be open files or StringIO.
     """
+
+    stdin: Any
+    stdout: Any
+    stderr: Any
 
     def __init__(self, stdin, stdout, stderr):
         self.stdin = stdin

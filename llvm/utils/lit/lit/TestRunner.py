@@ -7,7 +7,9 @@ import shlex
 import tempfile
 import threading
 import traceback
-from typing import Optional, Tuple
+from copy import copy
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple, Union
 
 from lit.InprocBuiltins import InprocBuiltinIO, getDefaultInprocBuiltins
 from lit.ShCommands import GlobItem, Command
@@ -74,6 +76,104 @@ class ShellCommandResult(object):
         self.exitCode = exitCode
         self.timeoutReached = timeoutReached
         self.outputFiles = list(outputFiles)
+
+
+@dataclass
+class InprocBuiltinResult:
+    """
+    Result of invoking an in-process builtin command. This stores its exit code
+    and stdout/stderr streams.
+    """
+
+    exit_code: int
+    stdout: Any
+    stderr: Any
+
+
+class CommandInvocation:
+    """
+    Result of invoking a command: holds either a Popen for a out-of-proc
+    command or an InprocCommandResult for an in-process command.
+    This is designed to mirror the functionality of Popen for in-process 
+    commands too.
+    """
+
+    is_inproc: bool
+    popen: subprocess.Popen
+    inproc: InprocBuiltinResult
+
+    @staticmethod
+    def new_process_invocation(popen: subprocess.Popen) -> "CommandInvocation":
+        ret = CommandInvocation()
+        ret.is_inproc = False
+        ret.popen = popen
+        return ret
+
+    @staticmethod
+    def new_inproc_builtin(result: InprocBuiltinResult) -> "CommandInvocation":
+        ret = CommandInvocation()
+        ret.is_inproc = True
+        ret.inproc = result
+        return ret
+
+    def wait(self) -> int:
+        """
+        Wraps `Popen.wait`. For in-process builtin commands, there is nothing
+        to wait for, so just returns the exit code.
+        """
+
+        if self.is_inproc:
+            return self.inproc.exit_code
+        else:
+            return self.popen.wait()
+
+    def communicate(self) -> Tuple[Union[str, bytes], Union[str, bytes]]:
+        """
+        Wraps `Popen.communicate`. For in-process builtin commands, this is
+        the same as `read_output`.
+        """
+
+        if self.is_inproc:
+            return self.read_output()
+        else:
+            return self.popen.communicate()
+
+    def get_exit_code(self) -> int:
+        """
+        Returns the exit code from the invoked command.
+        This function should only be called once the command has finished.
+        """
+
+        if self.is_inproc:
+            return self.inproc.exit_code
+        else:
+            assert self.popen.returncode is not None, "get_exit_code called but returncode is None (subprocess has not exited)"
+            return self.popen.returncode
+
+    def read_output(self) -> Tuple[Union[str, bytes], Union[str, bytes]]:
+        """
+        Reads from the stdout and stderr pipes and returns the result.
+        The read string may be a str or bytes object depending on the stream
+        type.
+        """
+
+        if self.is_inproc:
+            # Read and clear stdout. This is to mirror the pipe behaviour of regular processes
+            # stdout (reading stdout twice should not return the original content the second time).
+            return (
+                self.inproc.stdout.read(),
+                self.inproc.stderr.read()
+            )
+        else:
+            if self.popen.stdout is not None:
+                out = self.popen.stdout.read()
+            else:
+                out = ""
+            if self.popen.stderr is not None:
+                err = self.popen.stderr.read()
+            else:
+                err = ""
+            return (out, err)
 
 
 class TimeoutHelper(object):
@@ -414,7 +514,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         raise ValueError("Unknown shell command: %r" % cmd.op)
     assert isinstance(cmd, ShUtil.Pipeline)
 
-    procs = []
+    invocations: list[CommandInvocation] = []
     proc_not_counts = []
     default_stdin = subprocess.PIPE
     stderrTempFiles = []
@@ -425,6 +525,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         os.path.dirname(os.path.abspath(__file__)), "builtin_commands"
     )
     inproc_builtins = getDefaultInprocBuiltins()
+    proc_output = []
     # To avoid deadlock, we use a single stderr stream for piped
     # output. This is null until we have seen some output using
     # stderr.
@@ -477,44 +578,8 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             else:
                 break
 
-        # Handle in-process builtins.
-        #
-        # Handle "echo" as a builtin if it is not part of a pipeline. This
-        # greatly speeds up tests that construct input files by repeatedly
-        # echo-appending to a file.
-        # FIXME: Standardize on the builtin echo implementation. We can use a
-        # temporary file to sidestep blocking pipe write issues.
-
         # Ensure args[0] is hashable.
         args[0] = expand_glob(args[0], cmd_shenv.cwd)[0]
-
-        inproc_builtin = inproc_builtins.get(args[0], None)
-        if inproc_builtin and (args[0] != "echo" or len(cmd.commands) == 1):
-            # env calling an in-process builtin is useless, so we take the safe
-            # approach of complaining.
-            if not cmd_shenv is shenv:
-                raise InternalShellError(
-                    j, "Error: 'env' cannot call '{}'".format(args[0])
-                )
-            if not_crash:
-                raise InternalShellError(
-                    j, "Error: 'not --crash' cannot call" " '{}'".format(args[0])
-                )
-            if len(cmd.commands) != 1:
-                raise InternalShellError(
-                    j,
-                    "Unsupported: '{}' cannot be part" " of a pipeline".format(args[0]),
-                )
-            builtin_io = InprocBuiltinIO(io.StringIO(), io.StringIO(), io.StringIO())
-            command = Command(args, j.redirects)
-            args_expanded = expand_glob_expressions(args, cmd_shenv.cwd)
-            exit_code = inproc_builtin(command, args_expanded, cmd_shenv, builtin_io)
-            result = ShellCommandResult(command, builtin_io.stdout.read(), builtin_io.stderr.read(), exit_code, False, [])
-            if not_count % 2:
-                result.exitCode = int(not result.exitCode)
-            result.command.args = j.args
-            results.append(result)
-            return result.exitCode
 
         # Resolve any out-of-process builtin command before adding back 'not'
         # commands.
@@ -553,30 +618,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         else:
             stderrIsStdout = False
 
-            # Don't allow stderr on a PIPE except for the last
-            # process, this could deadlock.
-            #
-            # FIXME: This is slow, but so is deadlock.
-            if stderr == subprocess.PIPE and j != cmd.commands[-1]:
-                stderr = tempfile.TemporaryFile(mode="w+b")
-                stderrTempFiles.append((i, stderr))
-
-        # Resolve the executable path ourselves.
-        executable = None
-        # For paths relative to cwd, use the cwd of the shell environment.
-        if args[0].startswith("."):
-            exe_in_cwd = os.path.join(cmd_shenv.cwd, args[0])
-            if os.path.isfile(exe_in_cwd):
-                executable = exe_in_cwd
-        if not executable:
-            # Use the path from cmd_shenv by default, but if the environment variable
-            # is unset (like if the user is using env -i), use the standard path.
-            path = (
-                cmd_shenv.env["PATH"] if "PATH" in cmd_shenv.env else shenv.env["PATH"]
-            )
-            executable = lit.util.which(args[0], path)
-        if not executable:
-            raise InternalShellError(j, "%r: command not found" % args[0])
+        # Don't allow stderr on a PIPE except for the last
+        # process, this could deadlock.
+        #
+        # FIXME: This is slow, but so is deadlock.
+        if stderr == subprocess.PIPE and j != cmd.commands[-1]:
+            stderr = tempfile.TemporaryFile(mode="w+b")
+            stderrTempFiles.append((i, stderr))
 
         # Replace uses of /dev/null with temporary files.
         if kAvoidDevNull:
@@ -595,29 +643,86 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         if kIsWindows:
             args = quote_windows_command(args)
 
-        # Handle any resource limits. We do this by launching the command with
-        # a wrapper that sets the necessary limits. We use a wrapper rather than
-        # setting the limits in process as we cannot reraise the limits back to
-        # their defaults without elevated permissions.
-        if cmd_shenv.ulimit:
-            executable = sys.executable
-            args.insert(0, sys.executable)
-            args.insert(1, os.path.join(builtin_commands_dir, "_launch_with_limit.py"))
-            for limit in cmd_shenv.ulimit:
-                cmd_shenv.env["LIT_INTERNAL_ULIMIT_" + limit] = str(
-                    cmd_shenv.ulimit[limit]
-                )
+        # Handle in-process builtins.
+        inproc_builtin = inproc_builtins.get(args[0], None)
+        if inproc_builtin:
+            # Sort out input and output streams for inproc-builtins.
+            # Files stay the same, while pipes become StringIO.
+            def replace_pipes(stream):
+                if stream == subprocess.PIPE or stream == subprocess.STDOUT:
+                    return io.StringIO(newline="\n")
+                else:
+                    return stream
 
-        try:
-            # TODO(boomanaiden154): We currently wrap the subprocess.Popen with
-            # os.umask as the umask argument in subprocess.Popen is not
-            # available before Python 3.9. Once LLVM requires at least Python
-            # 3.9, this code should be updated to use umask argument.
-            old_umask = -1
-            if cmd_shenv.umask != -1:
-                old_umask = os.umask(cmd_shenv.umask)
-            procs.append(
-                subprocess.Popen(
+            builtin_io = InprocBuiltinIO(
+                replace_pipes(stdin),
+                replace_pipes(stdout),
+                replace_pipes(stderr),
+            )
+
+            if invocations:
+                # Wait for the last process to finish to get its output.
+                (last_process_stdout, last_process_stderr) = invocations[-1].communicate()
+                if stdin == subprocess.PIPE:
+                    builtin_io.stdin.write(last_process_stdout)
+
+                # Store last command's output in proc_output.
+                proc_output[-1] = (last_process_stdout, last_process_stderr)
+
+            command = Command(args, j.redirects)
+            args_expanded = expand_glob_expressions(args, cmd_shenv.cwd)
+            exit_code = inproc_builtin(command, args_expanded, cmd_shenv, builtin_io)
+
+            result = InprocBuiltinResult(
+                exit_code=exit_code,
+                stdout=builtin_io.stdout,
+                stderr=builtin_io.stderr,
+            )
+
+            invocations.append(CommandInvocation.new_inproc_builtin(result))
+
+            # TODO(BStott): update default stdin so next process takes input from this one.
+            default_stdin = subprocess.PIPE
+        else:
+            # Resolve the executable path ourselves.
+            executable = None
+            # For paths relative to cwd, use the cwd of the shell environment.
+            if args[0].startswith("."):
+                exe_in_cwd = os.path.join(cmd_shenv.cwd, args[0])
+                if os.path.isfile(exe_in_cwd):
+                    executable = exe_in_cwd
+            if not executable:
+                # Use the path from cmd_shenv by default, but if the environment variable
+                # is unset (like if the user is using env -i), use the standard path.
+                path = (
+                    cmd_shenv.env["PATH"] if "PATH" in cmd_shenv.env else shenv.env["PATH"]
+                )
+                executable = lit.util.which(args[0], path)
+            if not executable:
+                raise InternalShellError(j, "%r: command not found" % args[0])
+
+            # Handle any resource limits. We do this by launching the command with
+            # a wrapper that sets the necessary limits. We use a wrapper rather than
+            # setting the limits in process as we cannot reraise the limits back to
+            # their defaults without elevated permissions.
+            if cmd_shenv.ulimit:
+                executable = sys.executable
+                args.insert(0, sys.executable)
+                args.insert(1, os.path.join(builtin_commands_dir, "_launch_with_limit.py"))
+                for limit in cmd_shenv.ulimit:
+                    cmd_shenv.env["LIT_INTERNAL_ULIMIT_" + limit] = str(
+                        cmd_shenv.ulimit[limit]
+                    )
+
+            try:
+                # TODO(boomanaiden154): We currently wrap the subprocess.Popen with
+                # os.umask as the umask argument in subprocess.Popen is not
+                # available before Python 3.9. Once LLVM requires at least Python
+                # 3.9, this code should be updated to use umask argument.
+                old_umask = -1
+                if cmd_shenv.umask != -1:
+                    old_umask = os.umask(cmd_shenv.umask)
+                popen = subprocess.Popen(
                     args,
                     cwd=cmd_shenv.cwd,
                     executable=executable,
@@ -629,29 +734,32 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
                     universal_newlines=True,
                     errors="replace",
                 )
-            )
-            if old_umask != -1:
-                os.umask(old_umask)
-            proc_not_counts.append(not_count)
-            # Let the helper know about this process
-            timeoutHelper.addProcess(procs[-1])
-        except OSError as e:
-            raise InternalShellError(
-                j, "Could not create process ({}) due to {}".format(executable, e)
-            )
+                invocations.append(CommandInvocation.new_process_invocation(popen))
+                if old_umask != -1:
+                    os.umask(old_umask)
+                # Let the helper know about this process
+                timeoutHelper.addProcess(popen)
 
-        # Immediately close stdin for any process taking stdin from us.
-        if stdin == subprocess.PIPE:
-            procs[-1].stdin.close()
-            procs[-1].stdin = None
+                # Immediately close stdin for any process taking stdin from us.
+                if stdin == subprocess.PIPE and popen.stdin is not None:
+                    popen.stdin.close()
+                    popen.stdin = None
 
-        # Update the current stdin source.
-        if stdout == subprocess.PIPE:
-            default_stdin = procs[-1].stdout
-        elif stderrIsStdout:
-            default_stdin = procs[-1].stderr
-        else:
-            default_stdin = subprocess.PIPE
+                # Update the current stdin source.
+                if stdout == subprocess.PIPE:
+                    default_stdin = popen.stdout
+                elif stderrIsStdout:
+                    default_stdin = popen.stderr
+                else:
+                    default_stdin = subprocess.PIPE
+            except OSError as e:
+                raise InternalShellError(
+                    j, "Could not create process ({}) due to {}".format(executable, e)
+                )
+
+        proc_not_counts.append(not_count)
+        # Proc output will be read later.
+        proc_output.append(None)
 
     # Explicitly close any redirected files. We need to do this now because we
     # need to release any handles we may have on the temporary files (important
@@ -661,29 +769,27 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         f.close()
 
     # FIXME: There is probably still deadlock potential here. Yawn.
-    procData = [None] * len(procs)
-    procData[-1] = procs[-1].communicate()
+    (stdout, stderr) = invocations[-1].communicate()
 
-    for i in range(len(procs) - 1):
-        if procs[i].stdout is not None:
-            out = procs[i].stdout.read()
-        else:
-            out = ""
-        if procs[i].stderr is not None:
-            err = procs[i].stderr.read()
-        else:
-            err = ""
-        procData[i] = (out, err)
+    proc_output[-1] = (stdout, stderr)
+
+    for i in range(len(invocations) - 1):
+        if proc_output[i] is None:
+            # It is possible that the output from this command was already
+            # read, to be passed to an in-process builtin. Then it was already
+            # stored in proc_output.
+
+            proc_output[i] = invocations[i].read_output()
 
     # Read stderr out of the temp files.
     for i, f in stderrTempFiles:
         f.seek(0, 0)
-        procData[i] = (procData[i][0], f.read())
+        proc_output[i] = (proc_output[i][0], f.read())
         f.close()
 
     exitCode = None
-    for i, (out, err) in enumerate(procData):
-        res = procs[i].wait()
+    for i, (out, err) in enumerate(proc_output):
+        res = invocations[i].wait()
         # Detect Ctrl-C in subprocess.
         if res == -signal.SIGINT:
             raise KeyboardInterrupt

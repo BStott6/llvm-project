@@ -16,14 +16,6 @@
 # CHECK: *** TEST 'shtest-shell :: capital-t-error-message.txt' FAILED ***
 # CHECK: ValueError: %T is no longer supported. Please create directories with names based on %t.
 
-# CHECK: FAIL: shtest-shell :: colon-error.txt
-# CHECK: *** TEST 'shtest-shell :: colon-error.txt' FAILED ***
-# CHECK: :
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | Unsupported: ':' cannot be part of a pipeline
-# CHECK: # error: command failed with exit status: 127
-# CHECK: ***
-
 # CHECK: PASS: shtest-shell :: continuations.txt
 
 # CHECK: PASS: shtest-shell :: dev-null.txt
@@ -560,14 +552,6 @@
 # CHECK: Unsupported redirect:
 # CHECK: ***
 
-# CHECK: FAIL: shtest-shell :: mkdir-error-0.txt
-# CHECK: *** TEST 'shtest-shell :: mkdir-error-0.txt' FAILED ***
-# CHECK: mkdir -p temp | rm -rf temp
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | Unsupported: 'mkdir' cannot be part of a pipeline
-# CHECK: # error: command failed with exit status: 127
-# CHECK: ***
-
 # CHECK: FAIL: shtest-shell :: mkdir-error-1.txt
 # CHECK: *** TEST 'shtest-shell :: mkdir-error-1.txt' FAILED ***
 # CHECK: mkdir -p -m 777 temp
@@ -590,14 +574,6 @@
 # CHECK: ***
 
 # CHECK: PASS: shtest-shell :: redirects.txt
-
-# CHECK: FAIL: shtest-shell :: rm-error-0.txt
-# CHECK: *** TEST 'shtest-shell :: rm-error-0.txt' FAILED ***
-# CHECK: rm -rf temp | echo "hello"
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | Unsupported: 'rm' cannot be part of a pipeline
-# CHECK: # error: command failed with exit status: 127
-# CHECK: ***
 
 # CHECK: FAIL: shtest-shell :: rm-error-1.txt
 # CHECK: *** TEST 'shtest-shell :: rm-error-1.txt' FAILED ***
