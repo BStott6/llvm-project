@@ -127,7 +127,7 @@ class CommandInvocation:
         else:
             return self.popen.wait()
 
-    def communicate(self) -> Tuple[Union[str, bytes], Union[str, bytes]]:
+    def communicate(self) -> Tuple[Union[str, bytes, None], Union[str, bytes, None]]:
         """
         Wraps `Popen.communicate`. For in-process builtin commands, this is
         the same as `read_output`.
@@ -150,20 +150,22 @@ class CommandInvocation:
             assert self.popen.returncode is not None, "get_exit_code called but returncode is None (subprocess has not exited)"
             return self.popen.returncode
 
-    def read_output(self) -> Tuple[Union[str, bytes], Union[str, bytes]]:
+    def read_output(self) -> Tuple[Union[str, bytes, None], Union[str, bytes, None]]:
         """
-        Reads from the stdout and stderr pipes and returns the result.
+        Reads from piped the stdout and stderr and returns the result.
         The read string may be a str or bytes object depending on the stream
-        type.
+        type, or None if that the corresponding stream isn't piped.
         """
 
         if self.is_inproc:
-            # Read and clear stdout. This is to mirror the pipe behaviour of regular processes
-            # stdout (reading stdout twice should not return the original content the second time).
-            return (
-                self.inproc.stdout.read(),
-                self.inproc.stderr.read()
-            )
+            if self.inproc.stdout is not None:
+                out = self.inproc.stdout.read()
+            else:
+                out = ""
+            if self.inproc.stderr is not None:
+                err = self.inproc.stderr.read()
+            else:
+                err = ""
         else:
             if self.popen.stdout is not None:
                 out = self.popen.stdout.read()
@@ -173,7 +175,8 @@ class CommandInvocation:
                 err = self.popen.stderr.read()
             else:
                 err = ""
-            return (out, err)
+
+        return (out, err)
 
 
 class TimeoutHelper(object):
@@ -597,15 +600,6 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
         # relevant to 'not' commands and (2) the 'env' command should always
         # blindly pass along the status it receives from any command it calls.
 
-        # For plain negations, either 'not' without '--crash', or the shell
-        # operator '!', leave them out from the command to execute and
-        # invert the result code afterwards.
-        if not_crash:
-            args = not_args + args
-            not_count = 0
-        else:
-            not_args = []
-
         stdin, stdout, stderr = processRedirects(
             j, default_stdin, cmd_shenv, opened_files
         )
@@ -644,7 +638,33 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             args = quote_windows_command(args)
 
         # Handle in-process builtins.
-        inproc_builtin = inproc_builtins.get(args[0], None)
+        inproc_builtin, may_fallback = inproc_builtins.get(args[0], (None, False))
+
+        error = None
+        if inproc_builtin:
+            # not --crash cannot call in-proc builtins.
+            if not_crash:
+                 error = "Error: 'not --crash' cannot call" " '{}'".format(args[0])
+            # env cannot call in-proc builtins.
+            # TODO: Look into allowing env to call in-proc builtins?
+            if not cmd_shenv is shenv:
+                error = "Error: 'env' cannot call '{}'".format(args[0])
+
+        if error:
+            if may_fallback:
+                inproc_builtin = None 
+            else:
+                raise InternalShellError(j, error)
+
+        # For plain negations, either 'not' without '--crash', or the shell
+        # operator '!', leave them out from the command to execute and
+        # invert the result code afterwards.
+        if not_crash:
+            args = not_args + args
+            not_count = 0
+        else:
+            not_args = []
+
         if inproc_builtin:
             # Sort out input and output streams for inproc-builtins.
             # Files stay the same, while pipes become StringIO.
@@ -673,10 +693,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             args_expanded = expand_glob_expressions(args, cmd_shenv.cwd)
             exit_code = inproc_builtin(command, args_expanded, cmd_shenv, builtin_io)
 
+            builtin_io.stdout.seek(0)
+            builtin_io.stderr.seek(0)
+
             result = InprocBuiltinResult(
                 exit_code=exit_code,
-                stdout=builtin_io.stdout,
-                stderr=builtin_io.stderr,
+                stdout=builtin_io.stdout if stdout == subprocess.PIPE else None,
+                stderr=builtin_io.stderr if stderr == subprocess.PIPE else None,
             )
 
             invocations.append(CommandInvocation.new_inproc_builtin(result))

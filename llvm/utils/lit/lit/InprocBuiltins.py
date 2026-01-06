@@ -3,7 +3,7 @@ import os
 import pathlib
 import shutil
 import stat
-from typing import Any, Callable
+from typing import Any, Callable, Tuple
 
 import lit.util
 from lit.ShCommands import Command
@@ -129,7 +129,7 @@ def executeBuiltinEcho(cmd: Command, args: list[str], shenv: ShellEnvironment, i
 def executeBuiltinMkdir(cmd: Command, args: list[str], cmd_shenv: ShellEnvironment, io: InprocBuiltinIO):
     """executeBuiltinMkdir - Create new directories."""
     try:
-        opts, args = getopt.gnu_getopt(args, "p")
+        opts, args = getopt.gnu_getopt(args[1:], "p")
     except getopt.GetoptError as err:
         raise InternalShellError(cmd, "Unsupported: 'mkdir':  %s" % str(err))
 
@@ -163,7 +163,7 @@ def executeBuiltinMkdir(cmd: Command, args: list[str], cmd_shenv: ShellEnvironme
 def executeBuiltinRm(cmd: Command, args: list[str], cmd_shenv: ShellEnvironment, io: InprocBuiltinIO):
     """executeBuiltinRm - Removes (deletes) files or directories."""
     try:
-        opts, args = getopt.gnu_getopt(args, "frR", ["--recursive"])
+        opts, args = getopt.gnu_getopt(args[1:], "frR", ["--recursive"])
     except getopt.GetoptError as err:
         raise InternalShellError(cmd, "Unsupported: 'rm':  %s" % str(err))
 
@@ -319,21 +319,28 @@ def executeBuiltinColon(cmd: Command, args: list[str], cmd_shenv: ShellEnvironme
 
 def getDefaultInprocBuiltins() -> dict[
     str,
-    InprocBuiltinCallable,
+    Tuple[InprocBuiltinCallable, bool],
 ]:
     """
+    getDefaultInprocBuiltins - Returns the map of command names to Lit's
+    in-process built-in implementations.
+    The entries are a pair of the callable for the builtin and a bool
+    that determines whether this inproc builtin may fall back to a
+    command of the same name in cases where in-proc builtins cannot be
+    used (e.g. as the argument to not --crash).
     """
+
     return {
-        "cd": executeBuiltinCd,
-        "export": executeBuiltinExport,
-        "echo": executeBuiltinEcho,
-        "@echo": executeBuiltinEcho,
-        "mkdir": executeBuiltinMkdir,
-        "popd": executeBuiltinPopd,
-        "pushd": executeBuiltinPushd,
-        "rm": executeBuiltinRm,
-        "ulimit": executeBuiltinUlimit,
-        "umask": executeBuiltinUmask,
-        ":": executeBuiltinColon,
+        "@echo": (executeBuiltinEcho, False),
+        "cd": (executeBuiltinCd, False),
+        "export": (executeBuiltinExport, False),
+        "echo": (executeBuiltinEcho, False),
+        "mkdir": (executeBuiltinMkdir, False),
+        "popd": (executeBuiltinPopd, False),
+        "pushd": (executeBuiltinPushd, False),
+        "rm": (executeBuiltinRm, False),
+        "ulimit": (executeBuiltinUlimit, False),
+        "umask": (executeBuiltinUmask, False),
+        ":": (executeBuiltinColon, False),
     }
 
