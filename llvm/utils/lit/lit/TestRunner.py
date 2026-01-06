@@ -519,6 +519,10 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
     invocations: list[CommandInvocation] = []
     proc_not_counts = []
+    # May be:
+    # - subprocess.PIPE
+    # - stdout or stderr stream of previous process 
+    # - StringIO representing stdin or stdout stream of previous in-proc process
     default_stdin = subprocess.PIPE
     stderrTempFiles = []
     opened_files = []
@@ -667,17 +671,17 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
         if inproc_builtin:
             # Sort out input and output streams for inproc-builtins.
-            # Files stay the same, while pipes become StringIO.
-            def replace_pipes(stream):
+            # Files stay the same, while sentinels become StringIO.
+            def replace_sentinels(stream):
                 if stream == subprocess.PIPE or stream == subprocess.STDOUT:
                     return io.StringIO(newline="\n")
                 else:
                     return stream
 
             builtin_io = InprocBuiltinIO(
-                replace_pipes(stdin),
-                replace_pipes(stdout),
-                replace_pipes(stderr),
+                replace_sentinels(stdin),
+                replace_sentinels(stdout),
+                replace_sentinels(stderr),
             )
 
             if invocations:
@@ -693,7 +697,9 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
             args_expanded = expand_glob_expressions(args, cmd_shenv.cwd)
             exit_code = inproc_builtin(command, args_expanded, cmd_shenv, builtin_io)
 
+            builtin_io.stdout.flush()
             builtin_io.stdout.seek(0)
+            builtin_io.stderr.flush()
             builtin_io.stderr.seek(0)
 
             result = InprocBuiltinResult(
@@ -704,8 +710,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
             invocations.append(CommandInvocation.new_inproc_builtin(result))
 
-            # TODO(BStott): update default stdin so next process takes input from this one.
-            default_stdin = subprocess.PIPE
+            # Update the current stdin source.
+            if stdout == subprocess.PIPE:
+                default_stdin = result.stdout
+            elif stderrIsStdout:
+                default_stdin = result.stderr
+            else:
+                default_stdin = subprocess.PIPE
         else:
             # Resolve the executable path ourselves.
             executable = None
@@ -738,6 +749,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
                     )
 
             try:
+                # If the stdin source is the output stream of a in-process builtin 
+                # (StringIO), read it in order to provide it to the process.
+                piped_input = None
+                if isinstance(stdin, io.StringIO):
+                    piped_input = stdin.read()
+                    stdin = subprocess.PIPE
+
                 # TODO(boomanaiden154): We currently wrap the subprocess.Popen with
                 # os.umask as the umask argument in subprocess.Popen is not
                 # available before Python 3.9. Once LLVM requires at least Python
@@ -762,6 +780,10 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
                     os.umask(old_umask)
                 # Let the helper know about this process
                 timeoutHelper.addProcess(popen)
+            
+                if piped_input:
+                    assert popen.stdin
+                    popen.stdin.write(piped_input)
 
                 # Immediately close stdin for any process taking stdin from us.
                 if stdin == subprocess.PIPE and popen.stdin is not None:

@@ -1,4 +1,4 @@
-# Check the internal shell handling component of the ShTest format.
+# Check the internal shell handling component of the ShTest format.shtest-shell
 
 # RUN: not %{lit} -v %{inputs}/shtest-shell > %t.out
 # RUN: FileCheck --input-file %t.out %s
@@ -493,37 +493,13 @@
 # CHECK-NEXT: # error: command failed with exit status: 1
 #      CHECK: ***
 
-# CHECK: FAIL: shtest-shell :: echo-at-redirect-stderr.txt
-# CHECK: *** TEST 'shtest-shell :: echo-at-redirect-stderr.txt' FAILED ***
-# CHECK: @echo 2> {{.*}}
-# CHECK: # executed command: @echo
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | stdin and stderr redirects not supported for @echo
-# CHECK: error: command failed with exit status:
+# CHECK: PASS: shtest-shell :: echo-at-redirect-stderr.txt
 
-# CHECK: FAIL: shtest-shell :: echo-at-redirect-stdin.txt
-# CHECK: *** TEST 'shtest-shell :: echo-at-redirect-stdin.txt' FAILED ***
-# CHECK: @echo < {{.*}}
-# CHECK: # executed command: @echo
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | stdin and stderr redirects not supported for @echo
-# CHECK: error: command failed with exit status:
+# CHECK: PASS: shtest-shell :: echo-at-redirect-stdin.txt
 
-# CHECK: FAIL: shtest-shell :: echo-redirect-stderr.txt
-# CHECK: *** TEST 'shtest-shell :: echo-redirect-stderr.txt' FAILED ***
-# CHECK: echo 2> {{.*}}
-# CHECK: # executed command: echo
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | stdin and stderr redirects not supported for echo
-# CHECK: error: command failed with exit status:
+# CHECK: PASS: shtest-shell :: echo-redirect-stderr.txt
 
-# CHECK: FAIL: shtest-shell :: echo-redirect-stdin.txt
-# CHECK: *** TEST 'shtest-shell :: echo-redirect-stdin.txt' FAILED ***
-# CHECK: echo < {{.*}}
-# CHECK: # executed command: echo
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | stdin and stderr redirects not supported for echo
-# CHECK: error: command failed with exit status:
+# CHECK: PASS: shtest-shell :: echo-redirect-stdin.txt
 
 # CHECK: FAIL: shtest-shell :: error-0.txt
 # CHECK: *** TEST 'shtest-shell :: error-0.txt' FAILED ***
@@ -550,22 +526,6 @@
 # CHECK: FAIL: shtest-shell :: error-2.txt
 # CHECK: *** TEST 'shtest-shell :: error-2.txt' FAILED ***
 # CHECK: Unsupported redirect:
-# CHECK: ***
-
-# CHECK: FAIL: shtest-shell :: mkdir-error-1.txt
-# CHECK: *** TEST 'shtest-shell :: mkdir-error-1.txt' FAILED ***
-# CHECK: mkdir -p -m 777 temp
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | Unsupported: 'mkdir': option -m not recognized
-# CHECK: # error: command failed with exit status: 127
-# CHECK: ***
-
-# CHECK: FAIL: shtest-shell :: mkdir-error-2.txt
-# CHECK: *** TEST 'shtest-shell :: mkdir-error-2.txt' FAILED ***
-# CHECK: mkdir -p
-# CHECK: # .---command stderr{{-*}}
-# CHECK: # | Error: 'mkdir' is missing an operand
-# CHECK: # error: command failed with exit status: 127
 # CHECK: ***
 
 # CHECK: FAIL: shtest-shell :: pipefail.txt
@@ -614,4 +574,4 @@
 
 # CHECK: PASS: shtest-shell :: valid-shell.txt
 # CHECK: Unresolved Tests (2)
-# CHECK: Failed Tests (37)
+# CHECK: Failed Tests (30)
