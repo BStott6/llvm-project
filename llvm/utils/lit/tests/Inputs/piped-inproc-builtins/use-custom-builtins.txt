@@ -1,0 +1,20 @@
+Piping inproc builtin into inproc builtin into normal command.
+RUN: echo "hello" | uppercaser | grep -x "HELLO"
+
+Piping normal command into inproc builtin into normal command.
+RUN: echo "abcd" > %t.abcd
+RUN: cat %t.abcd | uppercaser | grep -x "ABCD"
+
+Redirecting stdout and stderr from inproc builtin.
+RUN: print_out_err "hello stdout" "hello stderr" > %t.out 2> %t.err
+RUN: grep -x "hello stdout" %t.out
+RUN: grep -x "hello stderr" %t.err
+
+Piping stderr from normal command into inproc builtin.
+COM: RUN: cat does_not_exist.txt 2>&1 | uppercaser | grep "[ERRNO 2] NO SUCH FILE OR DIRECTORY"
+
+Redirecting stdout and stderr from inproc builtin to the same file.
+RUN: print_out_err "some output" "some error" 2>&1 >%t.both
+RUN: grep -x "some output" %t.both
+RUN: grep -x "some error" %t.both
+END.

@@ -3,6 +3,7 @@ import io
 import os, signal, subprocess, sys
 import re
 import pathlib
+import runpy
 import shlex
 import tempfile
 import threading
@@ -11,13 +12,39 @@ from copy import copy
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
 
-from lit.InprocBuiltins import InprocBuiltinIO, getDefaultInprocBuiltins
+from lit.InprocBuiltins import InprocBuiltinCallable, InprocBuiltinIO, getDefaultInprocBuiltins
 from lit.ShCommands import GlobItem, Command
 from lit.ShellEnvironment import InternalShellError, ShellEnvironment, kAvoidDevNull, kDevNull, kIsWindows, kUseCloseFDs, updateEnv
 import lit.ShUtil as ShUtil
 import lit.Test as Test
 import lit.util
 from lit.BooleanExpression import BooleanExpression
+
+
+custom_inproc_builtin_cache = {}
+def loadCustomInprocBuiltin(
+    module_path: str,
+    function_name: str
+) -> InprocBuiltinCallable:
+    if (module_path, function_name) in custom_inproc_builtin_cache:
+        return custom_inproc_builtin_cache[(module_path, function_name)]
+
+    builtin_fn = runpy.run_path(module_path)[function_name]
+    custom_inproc_builtin_cache[(module_path, function_name)] = builtin_fn
+    return builtin_fn
+
+
+def getAllCustomInprocBuiltins(
+    custom_inproc_builtins: dict[str, Tuple[str, str, bool]],
+) -> dict[str, Tuple[InprocBuiltinCallable, bool]]:
+    return {
+        key: (
+            loadCustomInprocBuiltin(module_path, function_name),
+            bool(may_fallback),
+        )
+        for (key, (module_path, function_name, may_fallback))
+        in custom_inproc_builtins.items()
+    }
 
 
 class ScriptFatal(Exception):
@@ -94,7 +121,7 @@ class CommandInvocation:
     """
     Result of invoking a command: holds either a Popen for a out-of-proc
     command or an InprocCommandResult for an in-process command.
-    This is designed to mirror the functionality of Popen for in-process 
+    This is designed to mirror the functionality of Popen for in-process
     commands too.
     """
 
@@ -257,7 +284,7 @@ class TimeoutHelper(object):
             self._doneKillPass = True
 
 
-def executeShCmd(cmd, shenv, results, timeout=0):
+def executeShCmd(cmd, shenv, results, timeout=0, customInprocBuiltins={}):
     """
     Wrapper around _executeShCmd that handles
     timeout
@@ -268,7 +295,7 @@ def executeShCmd(cmd, shenv, results, timeout=0):
     if timeout > 0:
         timeoutHelper.startTimer()
     try:
-        finalExitCode = _executeShCmd(cmd, shenv, results, timeoutHelper)
+        finalExitCode = _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins)
     except InternalShellError:
         e = sys.exc_info()[1]
         finalExitCode = 127
@@ -485,7 +512,7 @@ def _expandLateSubstitutions(cmd, arguments, cwd):
     return arguments
 
 
-def _executeShCmd(cmd, shenv, results, timeoutHelper):
+def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
     if timeoutHelper.timeoutReached():
         # Prevent further recursion if the timeout has been hit
         # as we should try avoid launching more processes.
@@ -493,25 +520,25 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
     if isinstance(cmd, ShUtil.Seq):
         if cmd.op == ";":
-            res = _executeShCmd(cmd.lhs, shenv, results, timeoutHelper)
-            return _executeShCmd(cmd.rhs, shenv, results, timeoutHelper)
+            res = _executeShCmd(cmd.lhs, shenv, results, timeoutHelper, customInprocBuiltins)
+            return _executeShCmd(cmd.rhs, shenv, results, timeoutHelper, customInprocBuiltins)
 
         if cmd.op == "&":
             raise InternalShellError(cmd, "unsupported shell operator: '&'")
 
         if cmd.op == "||":
-            res = _executeShCmd(cmd.lhs, shenv, results, timeoutHelper)
+            res = _executeShCmd(cmd.lhs, shenv, results, timeoutHelper, customInprocBuiltins)
             if res != 0:
-                res = _executeShCmd(cmd.rhs, shenv, results, timeoutHelper)
+                res = _executeShCmd(cmd.rhs, shenv, results, timeoutHelper, customInprocBuiltins)
             return res
 
         if cmd.op == "&&":
-            res = _executeShCmd(cmd.lhs, shenv, results, timeoutHelper)
+            res = _executeShCmd(cmd.lhs, shenv, results, timeoutHelper, customInprocBuiltins)
             if res is None:
                 return res
 
             if res == 0:
-                res = _executeShCmd(cmd.rhs, shenv, results, timeoutHelper)
+                res = _executeShCmd(cmd.rhs, shenv, results, timeoutHelper, customInprocBuiltins)
             return res
 
         raise ValueError("Unknown shell command: %r" % cmd.op)
@@ -531,7 +558,10 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
     builtin_commands_dir = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "builtin_commands"
     )
+
     inproc_builtins = getDefaultInprocBuiltins()
+    inproc_builtins.update(getAllCustomInprocBuiltins(customInprocBuiltins))
+
     proc_output = []
     # To avoid deadlock, we use a single stderr stream for piped
     # output. This is null until we have seen some output using
@@ -646,10 +676,10 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
         error = None
         if inproc_builtin:
-            # not --crash cannot call in-proc builtins.
+            # not --crash cannot call in-process builtins.
             if not_crash:
                  error = "Error: 'not --crash' cannot call" " '{}'".format(args[0])
-            # env cannot call in-proc builtins.
+            # env cannot call in-process builtins.
             # TODO: Look into allowing env to call in-proc builtins?
             if not cmd_shenv is shenv:
                 error = "Error: 'env' cannot call '{}'".format(args[0])
@@ -671,7 +701,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
 
         if inproc_builtin:
             # Sort out input and output streams for inproc-builtins.
-            # Files stay the same, while sentinels become StringIO.
+            # Files stay the same, while sentinels become an empty StringIO.
             def replace_sentinels(stream):
                 if stream == subprocess.PIPE or stream == subprocess.STDOUT:
                     return io.StringIO(newline="\n")
@@ -683,15 +713,6 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper):
                 replace_sentinels(stdout),
                 replace_sentinels(stderr),
             )
-
-            if invocations:
-                # Wait for the last process to finish to get its output.
-                (last_process_stdout, last_process_stderr) = invocations[-1].communicate()
-                if stdin == subprocess.PIPE:
-                    builtin_io.stdin.write(last_process_stdout)
-
-                # Store last command's output in proc_output.
-                proc_output[-1] = (last_process_stdout, last_process_stderr)
 
             command = Command(args, j.redirects)
             args_expanded = expand_glob_expressions(args, cmd_shenv.cwd)
@@ -994,7 +1015,11 @@ def executeScriptInternal(
     shenv.env["LIT_CURRENT_TESTCASE"] = test.getFullName()
 
     exitCode, timeoutInfo = executeShCmd(
-        cmd, shenv, results, timeout=litConfig.maxIndividualTestTime
+        cmd,
+        shenv,
+        results,
+        timeout=litConfig.maxIndividualTestTime,
+        customInprocBuiltins=litConfig.inproc_builtins
     )
 
     out = err = ""
