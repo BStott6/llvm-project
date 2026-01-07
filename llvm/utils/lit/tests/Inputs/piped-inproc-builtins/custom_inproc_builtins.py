@@ -9,7 +9,7 @@ def execute_print_out_err(
     args = args[1:]
 
     if len(args) != 2:
-        io.stderr.write("[Error 1] Expected two arguments.")
+        io.stderr.write("Expected two arguments.")
         return 1
 
     io.stdout.write(args[0])
@@ -24,3 +24,15 @@ def execute_uppercaser(
     io.stdout.write(io.stdin.read().upper())
 
     return 0
+
+
+def execute_streq(
+    cmd: Command, args: list[str], shenv: ShellEnvironment, io: InprocBuiltinIO
+) -> int:
+    args = args[1:]
+
+    if len(args) != 1:
+        io.stderr.write("Expected one argument.")
+        return 2
+    
+    return int(io.stdin.read() != args[0])

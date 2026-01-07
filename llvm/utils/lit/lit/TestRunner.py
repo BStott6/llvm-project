@@ -21,32 +21,6 @@ import lit.util
 from lit.BooleanExpression import BooleanExpression
 
 
-custom_inproc_builtin_cache = {}
-def loadCustomInprocBuiltin(
-    module_path: str,
-    function_name: str
-) -> InprocBuiltinCallable:
-    if (module_path, function_name) in custom_inproc_builtin_cache:
-        return custom_inproc_builtin_cache[(module_path, function_name)]
-
-    builtin_fn = runpy.run_path(module_path)[function_name]
-    custom_inproc_builtin_cache[(module_path, function_name)] = builtin_fn
-    return builtin_fn
-
-
-def getAllCustomInprocBuiltins(
-    custom_inproc_builtins: dict[str, Tuple[str, str, bool]],
-) -> dict[str, Tuple[InprocBuiltinCallable, bool]]:
-    return {
-        key: (
-            loadCustomInprocBuiltin(module_path, function_name),
-            bool(may_fallback),
-        )
-        for (key, (module_path, function_name, may_fallback))
-        in custom_inproc_builtins.items()
-    }
-
-
 class ScriptFatal(Exception):
     """
     A script had a fatal error such that there's no point in retrying.  The
@@ -177,6 +151,18 @@ class CommandInvocation:
             assert self.popen.returncode is not None, "get_exit_code called but returncode is None (subprocess has not exited)"
             return self.popen.returncode
 
+    def stdout(self):
+        if self.is_inproc:
+            return self.inproc.stdout
+        else:
+            return self.popen.stdout
+
+    def stderr(self):
+        if self.is_inproc:
+            return self.inproc.stderr
+        else:
+            return self.popen.stderr
+
     def read_output(self) -> Tuple[Union[str, bytes, None], Union[str, bytes, None]]:
         """
         Reads from piped the stdout and stderr and returns the result.
@@ -184,26 +170,46 @@ class CommandInvocation:
         type, or None if that the corresponding stream isn't piped.
         """
 
-        if self.is_inproc:
-            if self.inproc.stdout is not None:
-                out = self.inproc.stdout.read()
-            else:
-                out = ""
-            if self.inproc.stderr is not None:
-                err = self.inproc.stderr.read()
-            else:
-                err = ""
+        stdout = self.stdout()
+        stderr = self.stderr()
+
+        if stdout is not None:
+            out = stdout.read()
         else:
-            if self.popen.stdout is not None:
-                out = self.popen.stdout.read()
-            else:
-                out = ""
-            if self.popen.stderr is not None:
-                err = self.popen.stderr.read()
-            else:
-                err = ""
+            out = ""
+
+        if stderr is not None:
+            err = stderr.read()
+        else:
+            err = ""
 
         return (out, err)
+
+
+custom_inproc_builtin_cache = {}
+def loadCustomInprocBuiltin(
+    module_path: str,
+    function_name: str
+) -> InprocBuiltinCallable:
+    if (module_path, function_name) in custom_inproc_builtin_cache:
+        return custom_inproc_builtin_cache[(module_path, function_name)]
+
+    builtin_fn = runpy.run_path(module_path)[function_name]
+    custom_inproc_builtin_cache[(module_path, function_name)] = builtin_fn
+    return builtin_fn
+
+
+def getAllCustomInprocBuiltins(
+    custom_inproc_builtins: dict[str, Tuple[str, str, bool]],
+) -> dict[str, Tuple[InprocBuiltinCallable, bool]]:
+    return {
+        key: (
+            loadCustomInprocBuiltin(module_path, function_name),
+            bool(may_fallback),
+        )
+        for (key, (module_path, function_name, may_fallback))
+        in custom_inproc_builtins.items()
+    }
 
 
 class TimeoutHelper(object):
@@ -547,9 +553,9 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
     invocations: list[CommandInvocation] = []
     proc_not_counts = []
     # May be:
-    # - subprocess.PIPE
-    # - stdout or stderr stream of previous process 
-    # - StringIO representing stdin or stdout stream of previous in-proc process
+    # - subprocess.PIPE.
+    # - stdout or stderr stream of previous process.
+    # - StringIO representing stdin or stdout stream of previous in-proc process.
     default_stdin = subprocess.PIPE
     stderrTempFiles = []
     opened_files = []
@@ -650,9 +656,11 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
         # process, this could deadlock.
         #
         # FIXME: This is slow, but so is deadlock.
+        stderrPretendPipe = False
         if stderr == subprocess.PIPE and j != cmd.commands[-1]:
             stderr = tempfile.TemporaryFile(mode="w+b")
             stderrTempFiles.append((i, stderr))
+            stderrPretendPipe = True
 
         # Replace uses of /dev/null with temporary files.
         if kAvoidDevNull:
@@ -700,12 +708,14 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
             not_args = []
 
         if inproc_builtin:
-            # Sort out input and output streams for inproc-builtins.
-            # Files stay the same, while sentinels become an empty StringIO.
             def replace_sentinels(stream):
-                if stream == subprocess.PIPE or stream == subprocess.STDOUT:
+                if stream in [subprocess.PIPE, subprocess.STDOUT, None]:
                     return io.StringIO(newline="\n")
                 else:
+                    # Make sure the object provides an IO-like interface.
+                    assert lit.util.has_method(stream, "write")
+                    assert lit.util.has_method(stream, "read")
+
                     return stream
 
             builtin_io = InprocBuiltinIO(
@@ -714,30 +724,33 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
                 replace_sentinels(stderr),
             )
 
+            # If stderr is redirected to stdout and stdout is a pipe, use the 
+            # same stream for both.
+            if (stdout == subprocess.PIPE and stderr == subprocess.STDOUT):
+                builtin_io.stderr = builtin_io.stdout
+
             command = Command(args, j.redirects)
             args_expanded = expand_glob_expressions(args, cmd_shenv.cwd)
+
+            # Run the inproc builtin.
             exit_code = inproc_builtin(command, args_expanded, cmd_shenv, builtin_io)
 
-            builtin_io.stdout.flush()
             builtin_io.stdout.seek(0)
-            builtin_io.stderr.flush()
             builtin_io.stderr.seek(0)
+            builtin_io.stdout.flush()
+            builtin_io.stderr.flush()
 
             result = InprocBuiltinResult(
                 exit_code=exit_code,
-                stdout=builtin_io.stdout if stdout == subprocess.PIPE else None,
-                stderr=builtin_io.stderr if stderr == subprocess.PIPE else None,
+                stdout=builtin_io.stdout 
+                    if stdout == subprocess.PIPE
+                    else None,
+                stderr=builtin_io.stderr 
+                    if stderr in [subprocess.PIPE, subprocess.STDOUT] or stderrPretendPipe
+                    else None,
             )
 
             invocations.append(CommandInvocation.new_inproc_builtin(result))
-
-            # Update the current stdin source.
-            if stdout == subprocess.PIPE:
-                default_stdin = result.stdout
-            elif stderrIsStdout:
-                default_stdin = result.stderr
-            else:
-                default_stdin = subprocess.PIPE
         else:
             # Resolve the executable path ourselves.
             executable = None
@@ -771,9 +784,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
 
             try:
                 # If the stdin source is the output stream of a in-process builtin 
-                # (StringIO), read it in order to provide it to the process.
+                # read it in order to provide it to the process.
                 piped_input = None
-                if isinstance(stdin, io.StringIO):
+                if all([
+                    invocations and invocations[-1].is_inproc,
+                    stdin is not None,
+                    stdin != subprocess.PIPE,
+                ]):
                     piped_input = stdin.read()
                     stdin = subprocess.PIPE
 
@@ -801,30 +818,31 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
                     os.umask(old_umask)
                 # Let the helper know about this process
                 timeoutHelper.addProcess(popen)
-            
+
                 if piped_input:
-                    assert popen.stdin
                     popen.stdin.write(piped_input)
 
                 # Immediately close stdin for any process taking stdin from us.
                 if stdin == subprocess.PIPE and popen.stdin is not None:
                     popen.stdin.close()
                     popen.stdin = None
-
-                # Update the current stdin source.
-                if stdout == subprocess.PIPE:
-                    default_stdin = popen.stdout
-                elif stderrIsStdout:
-                    default_stdin = popen.stderr
-                else:
-                    default_stdin = subprocess.PIPE
             except OSError as e:
                 raise InternalShellError(
                     j, "Could not create process ({}) due to {}".format(executable, e)
                 )
 
+
+        # Update the current stdin source.
+        if stdout == subprocess.PIPE:
+            default_stdin = invocations[-1].stdout()
+        elif stderrIsStdout:
+            default_stdin = invocations[-1].stderr()
+        else:
+            default_stdin = subprocess.PIPE
+
         proc_not_counts.append(not_count)
         # Proc output will be read later.
+        # TODO(BStott) This change can be reverted.
         proc_output.append(None)
 
     # Explicitly close any redirected files. We need to do this now because we
