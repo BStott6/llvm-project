@@ -652,15 +652,15 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
         else:
             stderrIsStdout = False
 
-        # Don't allow stderr on a PIPE except for the last
-        # process, this could deadlock.
-        #
-        # FIXME: This is slow, but so is deadlock.
-        stderrPretendPipe = False
-        if stderr == subprocess.PIPE and j != cmd.commands[-1]:
-            stderr = tempfile.TemporaryFile(mode="w+b")
-            stderrTempFiles.append((i, stderr))
-            stderrPretendPipe = True
+            # Don't allow stderr on a PIPE except for the last
+            # process, this could deadlock.
+            #
+            # FIXME: This is slow, but so is deadlock.
+            stderrPretendPipe = False
+            if stderr == subprocess.PIPE and j != cmd.commands[-1]:
+                stderr = tempfile.TemporaryFile(mode="w+b")
+                stderrTempFiles.append((i, stderr))
+                stderrPretendPipe = True
 
         # Replace uses of /dev/null with temporary files.
         if kAvoidDevNull:

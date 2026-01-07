@@ -15,7 +15,7 @@ RUN: grep -x "hello stdout" %t.out
 RUN: grep -x "hello stderr" %t.err
 
 Piping stderr from normal command into inproc builtin.
-RUN: cat does_not_exist.txt 2>&1 >/dev/null | cat
+RUN: not cat does_not_exist.txt 2>&1 >/dev/null | uppercaser | streq "[ERRNO 2] NO SUCH FILE OR DIRECTORY: 'DOES_NOT_EXIST.TXT'"
 
 Piping stderr from inproc builtin into normal command.
 RUN: print_out_err "" "err" 2>&1 >/dev/null | grep "err"
