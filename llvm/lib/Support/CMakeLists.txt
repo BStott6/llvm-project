@@ -176,7 +176,7 @@ add_llvm_component_library(LLVMSupport
   CrashRecoveryContext.cpp
   CSKYAttributes.cpp
   CSKYAttributeParser.cpp
-  DaemonMode.cpp
+  DaemonDriver.cpp
   DataExtractor.cpp
   Debug.cpp
   DebugCounter.cpp

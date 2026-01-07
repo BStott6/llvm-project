@@ -8,4 +8,4 @@
 # RUN: %{lit} -v %{inputs}/piped-inproc-builtins | FileCheck %s -match-full-lines
 # END.
 
-# CHECK: PASS: use-custom-builtins.txt :: ({{.*}})
+# CHECK: PASS: piped-inproc-builtins :: use-custom-builtins.txt ({{.*}})

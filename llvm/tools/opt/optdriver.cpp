@@ -41,7 +41,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Remarks/HotnessThresholdParser.h"
-#include "llvm/Support/DaemonMode.h"
+#include "llvm/Support/DaemonDriver.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"

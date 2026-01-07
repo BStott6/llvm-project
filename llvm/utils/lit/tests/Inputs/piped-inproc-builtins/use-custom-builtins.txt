@@ -18,8 +18,9 @@ Piping stderr from normal command into inproc builtin.
 RUN: not cat does_not_exist.txt 2>&1 >/dev/null | uppercaser | streq "[ERRNO 2] NO SUCH FILE OR DIRECTORY: 'DOES_NOT_EXIST.TXT'"
 
 Piping stderr from inproc builtin into normal command.
-RUN: print_out_err "" "err" 2>&1 >/dev/null | grep "err"
+RUN: print_out_err "" "err" 2>&1 >/dev/null | grep -Fx "err"
 
 Piping stderr from inproc builtin into inproc builtin.
+RUN: print_out_err "" "err" 2>&1 >/dev/null | streq "err"
 
 END.
