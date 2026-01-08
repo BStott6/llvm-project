@@ -57,7 +57,7 @@ class UnexpectedDaemonOutput(Exception):
 class DaemonTool:
     executable_path: str
     daemon_proc: Optional[subprocess.Popen]
-    status_pipe_reader: Optional[int]
+    status_pipe_reader: Any
     stdout_queue: Queue
     stdout_enqueueing_thread: Optional[Thread]
     stderr_queue: Queue
@@ -85,7 +85,7 @@ class DaemonTool:
 
         # Close the old status pipe.
         if self.status_pipe_reader:
-            os.close(self.status_pipe_reader)
+            self.status_pipe_reader.close()
 
         # Close the old output enqueueing threads.
         if self.stdout_enqueueing_thread:
@@ -97,7 +97,7 @@ class DaemonTool:
         # This will be used by the daemon to communicate its status, including
         # exit codes.
         status_pipe_reader, status_pipe_writer = os.pipe()
-        self.status_pipe_reader = status_pipe_reader
+        self.status_pipe_reader = open(status_pipe_reader, "rb")
 
         # Make sure that the write end of the status pipe gets inherited
         # by the daemon.
@@ -161,7 +161,7 @@ class DaemonTool:
         # Run the tool.
         (exit_code, stdout_bytes, stderr_bytes) = self.command_run(args)
 
-        stdout.write(stdout_bytes.decode())
+        stdout.write(stdout_bytes)
         stdout.flush()
         stderr.write(stderr_bytes)
         stderr.flush()
@@ -175,7 +175,7 @@ class DaemonTool:
 
         # Wait for status report.
         assert self.status_pipe_reader
-        message = os.read(self.status_pipe_reader, 1024)
+        message = self.status_pipe_reader.readline()
         if message.startswith(b"finished"):
             # Command finished successfully.
 
@@ -231,8 +231,8 @@ class DaemonTool:
         """
 
         assert self.status_pipe_reader
-        message = os.read(self.status_pipe_reader, 1024)
-        if message.startswith(b"ok"):
+        message = self.status_pipe_reader.readline()
+        if message == b"ok\n":
             return
         elif message.startswith(b"error"):
             raise DaemonError(message.decode())
