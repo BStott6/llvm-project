@@ -13,7 +13,7 @@ from lit.ShellEnvironment import ShellEnvironment, InternalShellError, kIsWindow
 class InprocBuiltinIO:
     """
     Holds IO streams for an inproc builtin invocation.
-    These may be open files or StringIO.
+    These may be files open in binary mode or BytesIO.
     """
 
     stdin: Any
@@ -114,11 +114,11 @@ def executeBuiltinEcho(cmd: Command, args: list[str], shenv: ShellEnvironment, i
 
     if args:
         for arg in args[:-1]:
-            io.stdout.write(maybeUnescape(arg))
-            io.stdout.write(" ")
-        io.stdout.write(maybeUnescape(args[-1]))
+            io.stdout.write(maybeUnescape(arg).encode())
+            io.stdout.write(" ".encode())
+        io.stdout.write(maybeUnescape(args[-1]).encode())
     if write_newline:
-        io.stdout.write("\n")
+        io.stdout.write("\n".encode())
 
     for (name, mode, f, path) in opened_files:
         f.close()
@@ -155,7 +155,7 @@ def executeBuiltinMkdir(cmd: Command, args: list[str], cmd_shenv: ShellEnvironme
             try:
                 dir.mkdir(exist_ok=True)
             except OSError as err:
-                io.stderr.write("Error: 'mkdir' command failed, %s\n" % str(err))
+                io.stderr.write(("Error: 'mkdir' command failed, %s\n" % str(err)).encode())
                 exitCode = 1
     return exitCode
 
@@ -198,7 +198,7 @@ def executeBuiltinRm(cmd: Command, args: list[str], cmd_shenv: ShellEnvironment,
                 os.remove(path)
             elif os.path.isdir(path):
                 if not recursive:
-                    io.stderr.write("Error: %s is a directory\n" % path)
+                    io.stderr.write(("Error: %s is a directory\n" % path).encode())
                     exitCode = 1
                 if kIsWindows:
                     # NOTE: use ctypes to access `SHFileOperationsW` on Windows to
@@ -257,7 +257,7 @@ def executeBuiltinRm(cmd: Command, args: list[str], cmd_shenv: ShellEnvironment,
                     os.chmod(path, stat.S_IMODE(os.stat(path).st_mode) | stat.S_IWRITE)
                 os.remove(path)
         except OSError as err:
-            io.stderr.write("Error: 'rm' command failed, %s" % str(err))
+            io.stderr.write(("Error: 'rm' command failed, %s" % str(err)).encode())
             exitCode = 1
     return exitCode
 

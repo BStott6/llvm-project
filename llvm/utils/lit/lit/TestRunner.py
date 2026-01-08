@@ -414,19 +414,19 @@ def processRedirects(cmd, stdin_source, cmd_shenv, opened_files):
     redirects = [(0,), (1,), (2,)]
     for (op, filename) in cmd.redirects:
         if op == (">", 2):
-            redirects[2] = [filename, "w", None]
+            redirects[2] = [filename, "wb", None]
         elif op == (">>", 2):
-            redirects[2] = [filename, "a", None]
+            redirects[2] = [filename, "ab", None]
         elif op == (">&", 2) and filename in "012":
             redirects[2] = redirects[int(filename)]
         elif op == (">&",) or op == ("&>",):
-            redirects[1] = redirects[2] = [filename, "w", None]
+            redirects[1] = redirects[2] = [filename, "wb", None]
         elif op == (">",):
-            redirects[1] = [filename, "w", None]
+            redirects[1] = [filename, "wb", None]
         elif op == (">>",):
-            redirects[1] = [filename, "a", None]
+            redirects[1] = [filename, "ab", None]
         elif op == ("<",):
-            redirects[0] = [filename, "r", None]
+            redirects[0] = [filename, "rb", None]
         else:
             raise InternalShellError(
                 cmd, "Unsupported redirect: %r" % ((op, filename),)
@@ -479,11 +479,11 @@ def processRedirects(cmd, stdin_source, cmd_shenv, opened_files):
         else:
             # Make sure relative paths are relative to the cwd.
             redir_filename = os.path.join(cmd_shenv.cwd, name)
-            fd = open(redir_filename, mode, encoding="utf-8")
+            fd = open(redir_filename, mode)
         # Workaround a Win32 and/or subprocess bug when appending.
         #
         # FIXME: Actually, this is probably an instance of PR6753.
-        if mode == "a":
+        if mode == "ab":
             fd.seek(0, 2)
         # Mutate the underlying redirect list so that we can redirect stdout
         # and stderr to the same place without opening the file twice.
@@ -555,7 +555,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
     # May be:
     # - subprocess.PIPE.
     # - stdout or stderr stream of previous process.
-    # - StringIO representing stdin or stdout stream of previous in-proc process.
+    # - BytesIO representing stdin or stdout stream of previous in-proc process.
     default_stdin = subprocess.PIPE
     stderrTempFiles = []
     opened_files = []
@@ -568,7 +568,6 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
     inproc_builtins = getDefaultInprocBuiltins()
     inproc_builtins.update(getAllCustomInprocBuiltins(customInprocBuiltins))
 
-    proc_output = []
     # To avoid deadlock, we use a single stderr stream for piped
     # output. This is null until we have seen some output using
     # stderr.
@@ -710,7 +709,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
         if inproc_builtin:
             def replace_sentinels(stream):
                 if stream in [subprocess.PIPE, subprocess.STDOUT, None]:
-                    return io.StringIO(newline="\n")
+                    return io.BytesIO()
                 else:
                     # Make sure the object provides an IO-like interface.
                     assert lit.util.has_method(stream, "write")
@@ -810,8 +809,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
                     stderr=stderr,
                     env=cmd_shenv.env,
                     close_fds=kUseCloseFDs,
-                    universal_newlines=True,
-                    errors="replace",
+                    text=False,
                 )
                 invocations.append(CommandInvocation.new_process_invocation(popen))
                 if old_umask != -1:
@@ -819,17 +817,18 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
                 # Let the helper know about this process
                 timeoutHelper.addProcess(popen)
 
-                if piped_input:
-                    popen.stdin.write(piped_input)
-
-                # Immediately close stdin for any process taking stdin from us.
-                if stdin == subprocess.PIPE and popen.stdin is not None:
-                    popen.stdin.close()
-                    popen.stdin = None
             except OSError as e:
                 raise InternalShellError(
                     j, "Could not create process ({}) due to {}".format(executable, e)
                 )
+
+            if piped_input:
+                popen.stdin.write(piped_input)
+
+            # Immediately close stdin for any process taking stdin from us.
+            if stdin == subprocess.PIPE and popen.stdin is not None:
+                popen.stdin.close()
+                popen.stdin = None
 
 
         # Update the current stdin source.
@@ -841,9 +840,6 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
             default_stdin = subprocess.PIPE
 
         proc_not_counts.append(not_count)
-        # Proc output will be read later.
-        # TODO(BStott) This change can be reverted.
-        proc_output.append(None)
 
     # Explicitly close any redirected files. We need to do this now because we
     # need to release any handles we may have on the temporary files (important
@@ -855,15 +851,11 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
     # FIXME: There is probably still deadlock potential here. Yawn.
     (stdout, stderr) = invocations[-1].communicate()
 
+    proc_output = [None for _ in range(len(invocations))]
     proc_output[-1] = (stdout, stderr)
 
     for i in range(len(invocations) - 1):
-        if proc_output[i] is None:
-            # It is possible that the output from this command was already
-            # read, to be passed to an in-process builtin. Then it was already
-            # stored in proc_output.
-
-            proc_output[i] = invocations[i].read_output()
+        proc_output[i] = invocations[i].read_output()
 
     # Read stderr out of the temp files.
     for i, f in stderrTempFiles:
@@ -902,7 +894,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
         output_files = []
         if res != 0:
             for (name, mode, f, path) in sorted(opened_files):
-                if path is not None and mode in ("w", "a"):
+                if path is not None and mode in ("wb", "ab"):
                     try:
                         with open(path, "rb") as f:
                             data = f.read()
