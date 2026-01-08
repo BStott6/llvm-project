@@ -11,7 +11,7 @@
 namespace llvm {
 /// TODO(BStott) document.
 using ToolInvokeFn =
-    std::function<int(int Argc, char **Argv, MemoryBufferRef Input)>;
+    std::function<int(ArrayRef<const char *> Args, MemoryBufferRef Input)>;
 
 /// TODO(BStott) document.
 LLVM_ABI int daemonMain(ToolInvokeFn InvokeTool, ArrayRef<const char *> Args);

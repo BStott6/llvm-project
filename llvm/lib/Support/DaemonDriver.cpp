@@ -1,5 +1,3 @@
-// TODO(BStott) file header
-
 #include "llvm/Support/DaemonDriver.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -15,8 +13,7 @@
 
 using namespace llvm;
 
-/// Utility to read an input stream line-by-line, which doesn't seem to be
-/// supported by `MemoryBuffer`.
+/// Utility to read an input stream line-by-line.
 class LineReader {
 public:
   LineReader(FILE *File) : File(File) {}
@@ -41,8 +38,10 @@ private:
   size_t BufLen = 0;
 };
 
-[[noreturn]] static void reportError(const Twine &Err) {
-  llvm::errs() << "[daemon] Error: " << Err << "\n";
+/// This should only be used before the status pipe is set up - after,
+/// errors are reported to the user via the status pipe.
+[[noreturn]] static void reportInitError(const Twine &Err) {
+  llvm::errs() << "[daemon] error: " << Err << "\n";
   std::exit(1);
 }
 
@@ -53,24 +52,53 @@ public:
         StatusPipeWriter(createStatusPipeWriter(Args)) {};
 
   int run() {
+    // Inform the user that the daemon is ready to receive commands.
+    messageReady();
+
     LineReader StdinReader(stdin);
-    
+
+    while (const std::optional<StringRef> CommandOpt = StdinReader.readLine()) {
+      StringRef Command = *CommandOpt;
+
+      if (Command.consume_front(CommandRun)) {
+        bool Ok = onCommandRun(Command);
+        if (!Ok) return 1;
+      } else if (Command.consume_front(CommandInputFile)) {
+        bool Ok = onCommandInputFile(Command);
+        if (!Ok) return 1;
+      } else if (Command.consume_front(CommandInputString)) {
+        bool Ok = onCommandInputString(Command);
+        if (!Ok) return 1;
+      } else if (Command.consume_front(CommandExit)) {
+        break;
+      } else {
+        messageError("Unexpected command: " + Command);
+        return 1;
+      }
+    }
 
     return 0;
   }
 
 private:
+  static constexpr StringRef CommandRun = "run:";
+  static constexpr StringRef CommandInputFile = "input_file:";
+  static constexpr StringRef CommandInputString = "input_string:";
+  static constexpr StringRef CommandExit = "exit.";
+
+  static constexpr StringRef MessageReady = "ready.";
+  static constexpr StringRef MessageOk = "ok:";
+  static constexpr StringRef MessageError = "error:";
+
   static raw_fd_ostream createStatusPipeWriter(ArrayRef<const char *> Args) {
     int Fd;
 
-    if (Args.size() < 3) {
-      // By default, send messages via stdout.
-      Fd = STDOUT_FILENO;
+    if (Args.size() != 3) {
+      reportInitError("Expected two arguments: '--daemon-mode', then the status pipe file descriptor.");
     } else {
-      bool Err = StringRef(Args[2]).consumeInteger(10, Fd);
-
+      const bool Err = StringRef(Args[2]).consumeInteger(10, Fd);
       if (Err) {
-        reportError("Failed to parse file descriptor from second argument.");
+        reportInitError("Failed to parse file descriptor from second argument.");
       }
 
 #ifdef _WIN32
@@ -79,11 +107,92 @@ private:
 #endif
     }
 
-    return raw_fd_ostream(Fd, /*shouldClose=*/Fd != STDOUT_FILENO, /*unbuffered=*/true);
+    return raw_fd_ostream(Fd, /*shouldClose=*/true, /*unbuffered=*/true);
+  }
+
+  bool onCommandRun(StringRef Command) {
+    std::vector<std::string> Args = splitCommandIntoArgs(Command.trim());
+
+    // Convert arguments to C strings, so that they can be passed through
+    // `argc`.
+    SmallVector<char *, 16> ArgsCStr;
+    ArgsCStr.reserve(Args.size());
+    for (std::string &Arg : Args) {
+      // NB: Since C++11, `std::string` always has a null-terminator.
+      ArgsCStr.push_back(Arg.data());
+    }
+
+    // Invoke the tool itself.
+    int ExitCode = InvokeTool(ArgsCStr, MemoryBufferRef(ToolInput, "<stdin>"));
+
+    // Make sure the user gets all the output.
+    llvm::outs().flush();
+    llvm::errs().flush();
+
+    // Inform the user that the task is finished.
+    messageOk(ExitCode);
+
+    // Reset the tool input for the next invocation.
+    ToolInput.clear();
+    return true;
+  }
+
+  bool onCommandInputFile(StringRef Command) {
+    const StringRef FileName = Command.trim();
+
+    ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
+        MemoryBuffer::getFile(FileName);
+
+    if (std::error_code EC = FileOrErr.getError()) {
+      messageError("Couldn't open file '" + FileName + "':" + EC.message());
+      return false;
+    }
+
+    ToolInput = FileOrErr.get()->getMemBufferRef().getBuffer();
+    return true;
+  }
+
+  bool onCommandInputString(StringRef Command) {
+    // Read number of bytes.
+    size_t Len;
+    const bool Err = Command.consumeInteger(10, Len);
+    if (Err) {
+      messageError("Expected integer length after " + CommandInputString);
+      return false;
+    }
+    if (!Command.trim().empty()) {
+      messageError("Unexpected trailing characters in command: " + Command);
+      return false;
+    }
+
+    // Read `Len` bytes into `ToolInput`.
+    ToolInput.clear();
+    ToolInput.resize(Len);
+    size_t Read = fread(ToolInput.data(), sizeof(char), Len, stdin);
+
+    // Make sure the expected number of bytes was read.
+    if (Read != Len) {
+      messageError("Missing bytes for '" + CommandInputString + "': expected " +
+                   Twine(Len) + " got " + Twine(Read));
+      return false;
+    }
+    return true;
+  }
+
+  void messageReady() {
+    StatusPipeWriter << MessageReady << "\n";
+  }
+
+  void messageOk(int ExitCode) {
+    StatusPipeWriter << MessageOk << ExitCode << "\n";
+  }
+
+  void messageError(const Twine &Err) {
+    StatusPipeWriter << MessageError << Err << "\n";
   }
 
   /// Splits a command string into arguments.
-  static std::vector<std::string>
+  std::vector<std::string>
   splitCommandIntoArgs(const StringRef Command) {
     std::vector<std::string> Args;
     std::optional<char> OuterQuote; // " or '
@@ -127,7 +236,7 @@ private:
       LastChar = Char;
     }
     if (OuterQuote) {
-      reportError("Unterminated quotes in command");
+      messageError("Unterminated quotes in command");
     }
     if (!CurrentArgSoFar.empty()) {
       Args.push_back(CurrentArgSoFar);
@@ -137,6 +246,7 @@ private:
   }
 
   ToolInvokeFn InvokeTool;
+  std::string ToolInput;
   raw_fd_ostream StatusPipeWriter;
 };
 

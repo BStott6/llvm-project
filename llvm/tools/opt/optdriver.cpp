@@ -960,10 +960,11 @@ optMain(int argc, char **argv,
   // avoid using `ParseCommandLineOptions` to detect `--daemon-mode`.
   bool DaemonMode = argc >= 2 && (argv[1] == StringRef("--daemon-mode"));
   if (DaemonMode) {
-    runDaemonMode(
-        [&](int InvocationArgc, char **InvocationArgv, MemoryBufferRef Input) {
-          int ExitCode = optInvoke(InvocationArgc, InvocationArgv,
-                                   PassBuilderCallbacks, Input);
+    daemonMain(
+        [&](auto Args, auto Input) {
+          int ExitCode =
+              optInvoke(Args.size(), const_cast<char **>(Args.data()),
+                        PassBuilderCallbacks, Input);
 
           // Reset state for next invocation.
           if (AreStatisticsEnabled()) {
@@ -974,7 +975,8 @@ optMain(int argc, char **argv,
           // TODO reset debug counters
 
           return ExitCode;
-        });
+        },
+        ArrayRef(argv, argc));
     return 0;
   }
 
