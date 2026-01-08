@@ -9,7 +9,11 @@
 #include <functional>
 
 namespace llvm {
-/// TODO(BStott) document.
+/// "Main" function for a tool invoked by the daemon. This should not call
+/// `InitLLVM`; this should be run before `daemonMain`. The invoke function is
+/// responsible for resetting any managed global state, for example statistics
+/// and debug counters, to prevent any state from leaking to the next
+/// invocation.
 using ToolInvokeFn =
     std::function<int(ArrayRef<const char *> Args, MemoryBufferRef Input)>;
 

@@ -48,6 +48,13 @@ config.suffixes = [".ll", ".c", ".test", ".txt", ".s", ".mir", ".yaml", ".spv"]
 # directories.
 config.excludes = ["Inputs", "CMakeLists.txt", "README.txt", "LICENSE.txt"]
 
+# Register daemon tools.
+# TODO(BStott) better comment explaining this
+daemon_tools_module = os.path.join(config.llvm_src_root, "utils/lit/lit/llvm/daemon_tool.py")
+lit_config.inproc_builtins = {
+    os.path.join(config.llvm_tools_dir, "opt"): (daemon_tools_module, "invoke_llvm_daemon_tool", True)
+}
+
 if config.enable_profcheck:
     config.available_features.add("profcheck")
     # Exclude llvm-reduce tests for profcheck because we substitute the FileCheck

@@ -16,7 +16,13 @@ using namespace llvm;
 /// Utility to read an input stream line-by-line.
 class LineReader {
 public:
-  LineReader(FILE *File) : File(File) {}
+  LineReader() = delete;
+  LineReader(const LineReader &) = delete;
+  LineReader(LineReader &&) = delete;
+  LineReader &operator=(const LineReader &) = delete;
+  LineReader &operator=(LineReader &&) = delete;
+
+  explicit LineReader(FILE *File) : File(File) {}
 
   ~LineReader() {
     if (Buf)
@@ -53,7 +59,7 @@ public:
 
   int run() {
     // Inform the user that the daemon is ready to receive commands.
-    messageReady();
+    messageOk();
 
     LineReader StdinReader(stdin);
 
@@ -84,10 +90,10 @@ private:
   static constexpr StringRef CommandRun = "run:";
   static constexpr StringRef CommandInputFile = "input_file:";
   static constexpr StringRef CommandInputString = "input_string:";
-  static constexpr StringRef CommandExit = "exit.";
+  static constexpr StringRef CommandExit = "exit";
 
-  static constexpr StringRef MessageReady = "ready.";
-  static constexpr StringRef MessageOk = "ok:";
+  static constexpr StringRef MessageOk = "ok";
+  static constexpr StringRef MessageFinished = "finished:";
   static constexpr StringRef MessageError = "error:";
 
   static raw_fd_ostream createStatusPipeWriter(ArrayRef<const char *> Args) {
@@ -107,7 +113,10 @@ private:
 #endif
     }
 
-    return raw_fd_ostream(Fd, /*shouldClose=*/true, /*unbuffered=*/true);
+    // Only close the status pipe if it is not a standard stream.
+    bool ShouldClose = Fd != STDOUT_FILENO && Fd != STDERR_FILENO;
+
+    return raw_fd_ostream(Fd, ShouldClose, /*unbuffered=*/true);
   }
 
   bool onCommandRun(StringRef Command) {
@@ -125,15 +134,19 @@ private:
     // Invoke the tool itself.
     int ExitCode = InvokeTool(ArgsCStr, MemoryBufferRef(ToolInput, "<stdin>"));
 
+    // Send an extra newline on stdout and stderr, so readers using readline()
+    // get all the output. This is subsequently removed by Lit.
+    llvm::outs() << "\n";
+    llvm::errs() << "\n";
+
     // Make sure the user gets all the output.
     llvm::outs().flush();
     llvm::errs().flush();
 
-    // Inform the user that the task is finished.
-    messageOk(ExitCode);
-
     // Reset the tool input for the next invocation.
     ToolInput.clear();
+
+    messageFinished(ExitCode);
     return true;
   }
 
@@ -149,6 +162,8 @@ private:
     }
 
     ToolInput = FileOrErr.get()->getMemBufferRef().getBuffer();
+
+    messageOk();
     return true;
   }
 
@@ -164,6 +179,7 @@ private:
       messageError("Unexpected trailing characters in command: " + Command);
       return false;
     }
+    messageOk();
 
     // Read `Len` bytes into `ToolInput`.
     ToolInput.clear();
@@ -176,15 +192,17 @@ private:
                    Twine(Len) + " got " + Twine(Read));
       return false;
     }
+
+    messageOk();
     return true;
   }
 
-  void messageReady() {
-    StatusPipeWriter << MessageReady << "\n";
+  void messageOk() {
+    StatusPipeWriter << MessageOk << "\n";
   }
 
-  void messageOk(int ExitCode) {
-    StatusPipeWriter << MessageOk << ExitCode << "\n";
+  void messageFinished(int ExitCode) {
+    StatusPipeWriter << MessageFinished << ExitCode << "\n";
   }
 
   void messageError(const Twine &Err) {
@@ -237,6 +255,7 @@ private:
     }
     if (OuterQuote) {
       messageError("Unterminated quotes in command");
+      std::exit(1);
     }
     if (!CurrentArgSoFar.empty()) {
       Args.push_back(CurrentArgSoFar);
