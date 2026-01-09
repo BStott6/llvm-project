@@ -12,18 +12,11 @@ from lit.ShCommands import Command
 from lit.ShellEnvironment import ShellEnvironment, InternalShellError, kIsWindows, updateEnv
 
 
-def async_enqueue_output(daemon_tool, stream, queue):
-    """
-    Runs in a background thread, enqueueing bytes read from `stream` into `queue`.
-    This is required so we can read the stream content so far without
-    blocking in the main thread.
-    """
-
-    while daemon_tool.is_alive():
-        # NB: daemon always sends a new line after the output, so readline 
-        # will never miss any output.
-        line = stream.readline()
-        queue.put(line)
+def async_read_status_pipe(daemon):
+    while daemon.is_alive():
+        line = daemon.status_pipe.readline()
+        daemon.status_pipe_queue.put(line)
+    status_pipe_queue.put(b"")
 
 
 class DaemonError(Exception):
@@ -57,20 +50,16 @@ class UnexpectedDaemonOutput(Exception):
 class DaemonTool:
     executable_path: str
     daemon_proc: Optional[subprocess.Popen]
-    status_pipe_reader: Any
-    stdout_queue: Queue
-    stdout_enqueueing_thread: Optional[Thread]
-    stderr_queue: Queue
-    stderr_enqueueing_thread: Optional[Thread]
+    status_pipe: Any
+    status_pipe_queue: Queue
+    status_pipe_reader_thread: Thread
 
     def __init__(self, executable_path: str):
         self.executable_path = executable_path
         self.daemon_proc = None
-        self.status_pipe_reader = None
-        self.stdout_queue = Queue()
-        self.stdout_enqueueing_thread = None
-        self.stderr_queue = Queue()
-        self.stderr_enqueueing_thread = None
+        self.status_pipe = None
+        self.status_pipe_queue = Queue()
+        self.status_pipe_reader_thread = None
 
     def is_alive(self):
         if not self.daemon_proc:
@@ -84,20 +73,21 @@ class DaemonTool:
         assert not self.is_alive(), "start_daemon called but daemon is already alive."
 
         # Close the old status pipe.
-        if self.status_pipe_reader:
-            self.status_pipe_reader.close()
+        if self.status_pipe:
+            self.status_pipe.close()
 
-        # Close the old output enqueueing threads.
-        if self.stdout_enqueueing_thread:
-            self.stdout_enqueueing_thread.join()
-        if self.stderr_enqueueing_thread:
-            self.stderr_enqueueing_thread.join()
+        # Kill the old status pipe reading thread.
+        if self.status_pipe_reader_thread:
+            self.status_pipe_reader_thread.join()
+
+        # Clear 
+        self.status_pipe_queue = Queue()
 
         # Create a new status pipe for the daemon process.
         # This will be used by the daemon to communicate its status, including
         # exit codes.
         status_pipe_reader, status_pipe_writer = os.pipe()
-        self.status_pipe_reader = open(status_pipe_reader, "rb")
+        self.status_pipe = open(status_pipe_reader, "rb")
 
         # Make sure that the write end of the status pipe gets inherited
         # by the daemon.
@@ -116,27 +106,23 @@ class DaemonTool:
             pass_fds=[status_pipe_writer],
         )
 
+        os.set_blocking(self.daemon_proc.stdout.fileno(), False)
+        os.set_blocking(self.daemon_proc.stderr.fileno(), False)
+
         # Close our status pipe writer, as we only read from the pipe.
         os.close(status_pipe_writer)
-        
-        # Start the stdout and stderr enqueueing threads, so we can query the
-        # output gathered so far without blocking.
-        self.stdout_enqueueing_thread = Thread(
-            target=async_enqueue_output,
-            args=[self, self.daemon_proc.stdout, self.stdout_queue],
-            daemon=True,
-        )
-        self.stdout_enqueueing_thread.start()
 
-        self.stderr_enqueueing_thread = Thread(
-            target=async_enqueue_output,
-            args=[self, self.daemon_proc.stderr, self.stderr_queue],
+        # Start the status pipe reader thread.
+        self.status_pipe_reader_thread = Thread(
+            target=async_read_status_pipe,
+            args=[self],
             daemon=True,
         )
-        self.stderr_enqueueing_thread.start()
+        self.status_pipe_reader_thread.start()
 
         # Check initialization status.
         self.check_ok()
+
 
     def invoke(
         self,
@@ -173,34 +159,59 @@ class DaemonTool:
         self.daemon_proc.stdin.write(f"run:{cmd}\n".encode())
         self.daemon_proc.stdin.flush()
 
-        # Wait for status report.
-        assert self.status_pipe_reader
-        message = self.status_pipe_reader.readline()
+        message = b""
+        stdout = b""
+        stderr = b""
+        while (message == b"" or message == None) and self.is_alive():
+            # read everything from stdout so far
+            stdout_chunk = b""
+            while stdout_chunk == b"" and self.is_alive():
+                stdout_chunk = self.daemon_proc.stdout.read()
+                if stdout_chunk is None:
+                    break
+                stdout += stdout_chunk
+
+            # read everything from stderr so far
+            stderr_chunk = b""
+            while stderr_chunk == b"" and self.is_alive():
+                stderr_chunk = self.daemon_proc.stderr.read()
+                if stderr_chunk is None:
+                    break
+                stderr += stderr_chunk
+
+            try:
+                message = self.status_pipe_queue.get_nowait()
+            except Empty:
+                continue
+
+        # read last little chunk of stdout
+        stdout_chunk = b""
+        while stdout_chunk == b"" and self.is_alive():
+            stdout_chunk = self.daemon_proc.stdout.read()
+            if stdout_chunk is None:
+                break
+            stdout += stdout_chunk
+
+        # read last little chunk of stderr
+        stderr_chunk = b""
+        while stderr_chunk == b"" and self.is_alive():
+            stderr_chunk = self.daemon_proc.stderr.read()
+            if stderr_chunk is None:
+                break
+            stderr += stderr_chunk
+
         if message.startswith(b"finished"):
             # Command finished successfully.
 
             # Parse return code from the message
             exit_code = int(message.split(b":")[1].strip())
 
-            # Read stdout and stderr from the queues.
-            stdout = b""
-            while True:
-                try:
-                    stdout += self.stdout_queue.get_nowait()
-                except Empty:
-                    break
-            stderr = b""
-            while True:
-                try:
-                    stderr += self.stderr_queue.get_nowait()
-                except Empty:
-                    break
-
             return (exit_code, stdout, stderr)
 
         elif message.startswith(b"error"):
             raise DaemonError(message.decode())
         elif not message:
+            assert not self.is_alive()
             # Daemon exited while running the tool, meaning that the tool
             # being tested exited. This means that the daemon's return code
             # is the return code for the invocation.
@@ -230,8 +241,7 @@ class DaemonTool:
         This will hang if the daemon does not send any output.
         """
 
-        assert self.status_pipe_reader
-        message = self.status_pipe_reader.readline()
+        message = self.status_pipe_queue.get()
         if message == b"ok\n":
             return
         elif message.startswith(b"error"):

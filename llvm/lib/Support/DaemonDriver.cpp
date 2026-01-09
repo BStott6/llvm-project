@@ -134,11 +134,6 @@ private:
     // Invoke the tool itself.
     int ExitCode = InvokeTool(ArgsCStr, MemoryBufferRef(ToolInput, "<stdin>"));
 
-    // Send an extra newline on stdout and stderr, so readers using readline()
-    // get all the output. This is subsequently removed by Lit.
-    llvm::outs() << "\n";
-    llvm::errs() << "\n";
-
     // Make sure the user gets all the output.
     llvm::outs().flush();
     llvm::errs().flush();
@@ -199,14 +194,17 @@ private:
 
   void messageOk() {
     StatusPipeWriter << MessageOk << "\n";
+    StatusPipeWriter.flush();
   }
 
   void messageFinished(int ExitCode) {
     StatusPipeWriter << MessageFinished << ExitCode << "\n";
+    StatusPipeWriter.flush();
   }
 
   void messageError(const Twine &Err) {
     StatusPipeWriter << MessageError << Err << "\n";
+    StatusPipeWriter.flush();
   }
 
   /// Splits a command string into arguments.
