@@ -645,6 +645,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
 
         # If stderr wants to come from stdout, but stdout isn't a pipe, then put
         # stderr on a pipe and treat it as stdout.
+        stderrPretendPipe = False
         if stderr == subprocess.STDOUT and stdout != subprocess.PIPE:
             stderr = subprocess.PIPE
             stderrIsStdout = True
@@ -655,7 +656,6 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
             # process, this could deadlock.
             #
             # FIXME: This is slow, but so is deadlock.
-            stderrPretendPipe = False
             if stderr == subprocess.PIPE and j != cmd.commands[-1]:
                 stderr = tempfile.TemporaryFile(mode="w+b")
                 stderrTempFiles.append((i, stderr))
@@ -707,6 +707,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
             not_args = []
 
         if inproc_builtin:
+            # If stderr is redirected to stdout, we make sure to use the same
+            # stream for both so that the order of output is preserved.
+            stderrRedirectedToStdout = (
+                stdout == subprocess.PIPE 
+                    and stderr == subprocess.STDOUT
+            )
+
             def replace_sentinels(stream):
                 if stream in [subprocess.PIPE, subprocess.STDOUT, None]:
                     return io.BytesIO()
@@ -720,13 +727,13 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
             builtin_io = InprocBuiltinIO(
                 replace_sentinels(stdin),
                 replace_sentinels(stdout),
-                replace_sentinels(stderr),
+                stderr=None
             )
-
-            # If stderr is redirected to stdout and stdout is a pipe, use the 
-            # same stream for both.
-            if (stdout == subprocess.PIPE and stderr == subprocess.STDOUT):
-                builtin_io.stderr = builtin_io.stdout
+            builtin_io.stderr = (
+                builtin_io.stdout 
+                    if stderrRedirectedToStdout 
+                    else replace_sentinels(stderr)
+            )
 
             command = Command(args, j.redirects)
             args_expanded = expand_glob_expressions(args, cmd_shenv.cwd)
@@ -734,6 +741,9 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
             # Run the inproc builtin.
             exit_code = inproc_builtin(command, args_expanded, cmd_shenv, builtin_io)
 
+            # Make sure that the output is flushed, in case the next process
+            # tries to read it from a file (as our handles to these files don't
+            # close, they are not guarranteed to be flushed).
             builtin_io.stdout.seek(0)
             builtin_io.stderr.seek(0)
             builtin_io.stdout.flush()

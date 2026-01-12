@@ -67,19 +67,35 @@ public:
       StringRef Command = *CommandOpt;
 
       if (Command.consume_front(CommandRun)) {
-        bool Ok = onCommandRun(Command);
-        if (!Ok) return 1;
+        Command = Command.trim();
+        runTool(Command);
       } else if (Command.consume_front(CommandInputFile)) {
-        bool Ok = onCommandInputFile(Command);
-        if (!Ok) return 1;
+        Command = Command.trim();
+        readInputFromFile(Command);
       } else if (Command.consume_front(CommandInputString)) {
-        bool Ok = onCommandInputString(Command);
-        if (!Ok) return 1;
+        Command = Command.trim();
+
+        // Read number of bytes.
+        size_t Len;
+        const bool Err = Command.consumeInteger(10, Len);
+        if (Err) {
+          exitWithError("Expected integer length after " + CommandInputString);
+        }
+        if (!Command.trim().empty()) {
+          exitWithError("Unexpected trailing characters in command: " + *CommandOpt);
+        }
+        messageOk();
+
+        readInputFromStdin(Len);
       } else if (Command.consume_front(CommandExit)) {
         break;
+      } else if (Command.consume_front(CommandRedirectStderrToStdout)) {
+        if (!Command.trim().empty()) {
+          exitWithError("Unexpected trailing characters in command: " + *CommandOpt);
+        }
+        redirectStderrToStdout();
       } else {
-        messageError("Unexpected command: " + Command);
-        return 1;
+        exitWithError("Unexpected command: " + Command);
       }
     }
 
@@ -87,14 +103,15 @@ public:
   }
 
 private:
-  static constexpr StringRef CommandRun = "run:";
-  static constexpr StringRef CommandInputFile = "input_file:";
-  static constexpr StringRef CommandInputString = "input_string:";
+  static constexpr StringRef CommandRun = "run";
+  static constexpr StringRef CommandInputFile = "in.file";
+  static constexpr StringRef CommandInputString = "in.str";
   static constexpr StringRef CommandExit = "exit";
+  static constexpr StringRef CommandRedirectStderrToStdout = "redirect_stderr_to_stdout";
 
   static constexpr StringRef MessageOk = "ok";
-  static constexpr StringRef MessageFinished = "finished:";
-  static constexpr StringRef MessageError = "error:";
+  static constexpr StringRef MessageReturned = "returned";
+  static constexpr StringRef MessageError = "error";
 
   static raw_fd_ostream createStatusPipeWriter(ArrayRef<const char *> Args) {
     int Fd;
@@ -119,7 +136,23 @@ private:
     return raw_fd_ostream(Fd, ShouldClose, /*unbuffered=*/true);
   }
 
-  bool onCommandRun(StringRef Command) {
+  [[noreturn]] void exitWithError(const Twine &Err) {
+    StatusPipeWriter << MessageError << ' ' << Err << "\n";
+    StatusPipeWriter.flush();
+    std::exit(1);
+  }
+
+  void messageOk() {
+    StatusPipeWriter << MessageOk << "\n";
+    StatusPipeWriter.flush();
+  }
+
+  void messageReturned(int ExitCode) {
+    StatusPipeWriter << MessageReturned << ' ' << ExitCode << "\n";
+    StatusPipeWriter.flush();
+  }
+
+  void runTool(StringRef Command) {
     std::vector<std::string> Args = splitCommandIntoArgs(Command.trim());
 
     // Convert arguments to C strings, so that they can be passed through
@@ -127,7 +160,7 @@ private:
     SmallVector<char *, 16> ArgsCStr;
     ArgsCStr.reserve(Args.size());
     for (std::string &Arg : Args) {
-      // NB: Since C++11, `std::string` always has a null-terminator.
+      // NB: Since C++11, `std::string` is required to be null-terminated.
       ArgsCStr.push_back(Arg.data());
     }
 
@@ -138,44 +171,30 @@ private:
     llvm::outs().flush();
     llvm::errs().flush();
 
-    // Reset the tool input for the next invocation.
+    // Reset state for the next invocation.
     ToolInput.clear();
+    if (StderrRedirectedToStdout) {
+      resetStderr();
+    }
 
-    messageFinished(ExitCode);
-    return true;
+    // Inform the user that the command has finished and provide the exit code.
+    messageReturned(ExitCode);
   }
 
-  bool onCommandInputFile(StringRef Command) {
-    const StringRef FileName = Command.trim();
-
+  void readInputFromFile(StringRef Path) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
-        MemoryBuffer::getFile(FileName);
+        MemoryBuffer::getFile(Path);
 
     if (std::error_code EC = FileOrErr.getError()) {
-      messageError("Couldn't open file '" + FileName + "':" + EC.message());
-      return false;
+      exitWithError("Couldn't open file '" + Path + "': " + EC.message());
     }
 
     ToolInput = FileOrErr.get()->getMemBufferRef().getBuffer();
 
     messageOk();
-    return true;
   }
 
-  bool onCommandInputString(StringRef Command) {
-    // Read number of bytes.
-    size_t Len;
-    const bool Err = Command.consumeInteger(10, Len);
-    if (Err) {
-      messageError("Expected integer length after " + CommandInputString);
-      return false;
-    }
-    if (!Command.trim().empty()) {
-      messageError("Unexpected trailing characters in command: " + Command);
-      return false;
-    }
-    messageOk();
-
+  void readInputFromStdin(size_t Len) {
     // Read `Len` bytes into `ToolInput`.
     ToolInput.clear();
     ToolInput.resize(Len);
@@ -183,28 +202,32 @@ private:
 
     // Make sure the expected number of bytes was read.
     if (Read != Len) {
-      messageError("Missing bytes for '" + CommandInputString + "': expected " +
+      exitWithError("Missing bytes for '" + CommandInputString + "': expected " +
                    Twine(Len) + " got " + Twine(Read));
-      return false;
     }
 
     messageOk();
-    return true;
   }
 
-  void messageOk() {
-    StatusPipeWriter << MessageOk << "\n";
-    StatusPipeWriter.flush();
+  void redirectStderrToStdout() {
+    if (StderrRedirectedToStdout) {
+      exitWithError("Stderr is already redirected to stdout.");
+      std::exit(1);
+    }
+
+    llvm::errs().flush();
+    StderrCopy = dup(STDERR_FILENO);
+    dup2(STDOUT_FILENO, STDERR_FILENO);
+    StderrRedirectedToStdout = true;
   }
 
-  void messageFinished(int ExitCode) {
-    StatusPipeWriter << MessageFinished << ExitCode << "\n";
-    StatusPipeWriter.flush();
-  }
-
-  void messageError(const Twine &Err) {
-    StatusPipeWriter << MessageError << Err << "\n";
-    StatusPipeWriter.flush();
+  void resetStderr() {
+    assert(StderrCopy.has_value());
+    llvm::errs().flush();
+    dup2(*StderrCopy, STDERR_FILENO);
+    close(*StderrCopy);
+    StderrCopy = std::nullopt;
+    StderrRedirectedToStdout = false;
   }
 
   /// Splits a command string into arguments.
@@ -252,7 +275,7 @@ private:
       LastChar = Char;
     }
     if (OuterQuote) {
-      messageError("Unterminated quotes in command");
+      exitWithError("Unterminated quotes in command.");
       std::exit(1);
     }
     if (!CurrentArgSoFar.empty()) {
@@ -265,6 +288,8 @@ private:
   ToolInvokeFn InvokeTool;
   std::string ToolInput;
   raw_fd_ostream StatusPipeWriter;
+  bool StderrRedirectedToStdout = false;
+  std::optional<int> StderrCopy;
 };
 
 LLVM_ABI int llvm::daemonMain(ToolInvokeFn InvokeTool,

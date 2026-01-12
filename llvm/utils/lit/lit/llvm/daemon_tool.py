@@ -1,7 +1,7 @@
 import os
 import subprocess
 from threading import Thread
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 try:
     from queue import Queue, Empty
 except ImportError:
@@ -13,10 +13,16 @@ from lit.ShellEnvironment import ShellEnvironment, InternalShellError, kIsWindow
 
 
 def async_read_status_pipe(daemon):
+    """
+    Runs in the background, reading from the status pipe from the daemon
+    process and writing it to a queue. We use a queue so that the pipe can be 
+    read with blocking (via `get`) and without (via `get_nowait`)
+    """
+
     while daemon.is_alive():
         line = daemon.status_pipe.readline()
         daemon.status_pipe_queue.put(line)
-    status_pipe_queue.put(b"")
+    daemon.status_pipe_queue.put(b"")
 
 
 class DaemonError(Exception):
@@ -25,10 +31,8 @@ class DaemonError(Exception):
     """
 
     def __init__(self, message: str):
-        message = message.removeprefix("error:")
-
-        super().__init__(message)
-        self.message = message
+        super().__init__()
+        self.message = message.removeprefix("error ")
 
     def __str__(self) -> str:
         return f"Got error from daemon: {self.message}"
@@ -39,12 +43,31 @@ class UnexpectedDaemonOutput(Exception):
     Exception raised when the daemon tool sends an unexpected message.
     """
 
-    def __init__(self, message: str):
-        super().__init__(message)
+    def __init__(self, message: bytes):
+        super().__init__()
         self.message = message
 
     def __str__(self) -> str:
         return f"Unexpected message from daemon: {self.message}"
+
+
+class DaemonExited(Exception):
+    """
+    Exception raised when the daemon exits unexpectedly.
+    """
+
+    exit_code: int
+    stdout: bytes
+    stderr: bytes
+
+    def __init__(self, exit_code: int, stdout: bytes, stderr: bytes):
+        super().__init__()
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __str__(self) -> str:
+        return "Daemon exited unexpectedly with code {}.\nstdout:\n{}\nstderr:\n{}\n".format(self.exit_code, self.stdout, self.stderr)
 
 
 class DaemonTool:
@@ -52,7 +75,7 @@ class DaemonTool:
     daemon_proc: Optional[subprocess.Popen]
     status_pipe: Any
     status_pipe_queue: Queue
-    status_pipe_reader_thread: Thread
+    status_pipe_reader_thread: Optional[Thread]
 
     def __init__(self, executable_path: str):
         self.executable_path = executable_path
@@ -105,6 +128,8 @@ class DaemonTool:
             stderr=subprocess.PIPE,
             pass_fds=[status_pipe_writer],
         )
+        assert self.daemon_proc.stdout
+        assert self.daemon_proc.stderr
 
         os.set_blocking(self.daemon_proc.stdout.fileno(), False)
         os.set_blocking(self.daemon_proc.stderr.fileno(), False)
@@ -144,6 +169,13 @@ class DaemonTool:
             # Otherwise, read the input and provide it via stdin.
             self.command_input_string(stdin.read())
 
+        # If stdout and stderr are the same stream (which will be the case if
+        # stderr is redirected to stdout), inform the daemon to send stderr
+        # over stdout. We do this to make sure that the order of output is
+        # preserved.
+        if stderr == stdout:
+            self.send_command("redirect_stderr_to_stdout")
+
         # Run the tool.
         (exit_code, stdout_bytes, stderr_bytes) = self.command_run(args)
 
@@ -155,83 +187,83 @@ class DaemonTool:
         return exit_code
 
     def command_run(self, args: list[str]) -> Tuple[int, bytes, bytes]:
-        cmd = " ".join(args)
-        self.daemon_proc.stdin.write(f"run:{cmd}\n".encode())
-        self.daemon_proc.stdin.flush()
+        self.send_command(f"run {' '.join(args)}")
 
+        # Wait for a message on the status pipe, indicating the result of the
+        # command, while continually reading all output from the daemon on
+        # its output streams. It is important to read the output continually
+        # rather than reading it all at the end to avoid deadlock if the pipe
+        # becomes full.
         message = b""
         stdout = b""
         stderr = b""
-        while (message == b"" or message == None) and self.is_alive():
-            # read everything from stdout so far
-            stdout_chunk = b""
-            while stdout_chunk == b"" and self.is_alive():
-                stdout_chunk = self.daemon_proc.stdout.read()
-                if stdout_chunk is None:
-                    break
-                stdout += stdout_chunk
+        while self.is_alive():
+            # Read output from stdout and stderr so far.
+            stdout += self.read_output_so_far(self.daemon_proc.stdout)
+            stderr += self.read_output_so_far(self.daemon_proc.stderr)
 
-            # read everything from stderr so far
-            stderr_chunk = b""
-            while stderr_chunk == b"" and self.is_alive():
-                stderr_chunk = self.daemon_proc.stderr.read()
-                if stderr_chunk is None:
-                    break
-                stderr += stderr_chunk
-
+            # Check for a message from the status pipe, indicating that the
+            # task has finished.
             try:
                 message = self.status_pipe_queue.get_nowait()
+                break
             except Empty:
                 continue
 
-        # read last little chunk of stdout
-        stdout_chunk = b""
-        while stdout_chunk == b"" and self.is_alive():
-            stdout_chunk = self.daemon_proc.stdout.read()
-            if stdout_chunk is None:
-                break
-            stdout += stdout_chunk
+        # Make sure to read the remainder of the bytes in the output streams.
+        stdout += self.read_output_so_far(self.daemon_proc.stdout)
+        stderr += self.read_output_so_far(self.daemon_proc.stderr)
 
-        # read last little chunk of stderr
-        stderr_chunk = b""
-        while stderr_chunk == b"" and self.is_alive():
-            stderr_chunk = self.daemon_proc.stderr.read()
-            if stderr_chunk is None:
-                break
-            stderr += stderr_chunk
+        # Check that the message indicates that the task was completed.
+        try:
+            self.check_message(
+                message,
+                lambda message: message.startswith(b"returned"),
+            )
 
-        if message.startswith(b"finished"):
-            # Command finished successfully.
-
-            # Parse return code from the message
-            exit_code = int(message.split(b":")[1].strip())
-
+            # The exit code is stored in the message.
+            exit_code = int(message.removeprefix(b"returned").strip())
             return (exit_code, stdout, stderr)
+        except DaemonExited as e:
+            # The daemon exited during execution of the task, indicating that
+            # the LLVM code crashed or otherwise called `exit`.
+            # However the LLVM code exited, the exit code returned by the daemon
+            # process is the same as the code that the tool would have returned
+            # if run separately, so this is correct to use as the exit code for
+            # the test.
+            stdout += e.stdout
+            stderr += e.stderr
+            return (e.exit_code, stdout, stderr)
 
-        elif message.startswith(b"error"):
-            raise DaemonError(message.decode())
-        elif not message:
-            assert not self.is_alive()
-            # Daemon exited while running the tool, meaning that the tool
-            # being tested exited. This means that the daemon's return code
-            # is the return code for the invocation.
-            (stdout, stderr) = self.daemon_proc.communicate()
-            return (self.daemon_proc.returncode, stdout, stderr)
+    def read_output_so_far(self, pipe: Any) -> bytes:
+        """
+        Read all of the bytes currently in the pipe, which must be in non-
+        blocking mode.
+        """
 
-        raise UnexpectedDaemonOutput(message.decode())
+        output = b""
+        while self.is_alive():
+            chunk = pipe.read()
+            if not chunk:
+                break
+            output += chunk
+        
+        return output
 
     def command_input_file(self, path: str):
-        self.daemon_proc.stdin.write(f"input_file:{path}\n".encode())
-        self.daemon_proc.stdin.flush()
+        self.send_command(f"in.file {path}")
         self.check_ok()
 
     def command_input_string(self, s: bytes):
-        self.daemon_proc.stdin.write(f"input_string:{len(s)}\n".encode())
-        self.daemon_proc.stdin.flush()
+        self.send_command(f"in.str {len(s)}")
         self.check_ok()
         self.daemon_proc.stdin.write(s)
         self.daemon_proc.stdin.flush()
         self.check_ok()
+
+    def send_command(self, command: str):
+        self.daemon_proc.stdin.write(f"{command}\n".encode())
+        self.daemon_proc.stdin.flush()
 
     def check_ok(self):
         """
@@ -242,18 +274,30 @@ class DaemonTool:
         """
 
         message = self.status_pipe_queue.get()
-        if message == b"ok\n":
+        assert isinstance(message, bytes)
+        self.check_message(message, lambda message: message == b"ok")
+
+    def check_message(
+        self,
+        message: Optional[bytes],
+        predicate: Callable[[bytes], bool],
+    ):
+        """
+        Given a message read from the daemon's status pipe, checks that the
+        message matches the predicate. Otherwise, raises the appropriate
+        exception (DaemonError, DaemonExited, UnexpectedDaemonOutput)
+        """
+
+        if not message:
+            stdout, stderr = self.daemon_proc.communicate()
+            raise DaemonExited(self.daemon_proc.returncode, stdout, stderr)
+
+        if predicate(message.strip()):
             return
         elif message.startswith(b"error"):
             raise DaemonError(message.decode())
-        elif not message:
-            (stdout, stderr) = self.daemon_proc.communicate()
-            raise RuntimeError(
-                "Daemon exited unexpectedly with code {}.\nstdout:\n{}\nstderr:\n{}\n"
-                    .format(self.daemon_proc.returncode, stdout, stderr)
-            )
-
-        raise UnexpectedDaemonOutput(message.decode())
+        else:
+            raise UnexpectedDaemonOutput(message)
 
 
 daemons: dict[str, DaemonTool] = {}
