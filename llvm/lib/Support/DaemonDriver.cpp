@@ -7,8 +7,30 @@
 
 #if defined _WIN32
 # include <io.h>
-#else 
+#else
 # include <unistd.h>
+#endif
+
+// Standard stream fileno macros are not defined on Windows.
+#ifndef STDIN_FILENO
+# define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+# define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+# define STDERR_FILENO 2
+#endif
+
+// Windows emulated POSIX functions are prefixed by `_`.
+#ifdef _WIN32
+# define CLOSE_FN _close
+# define DUP_FN _dup
+# define DUP2_FN _dup2
+#else
+# define CLOSE_FN close
+# define DUP_FN dup
+# define DUP2_FN dup2
 #endif
 
 using namespace llvm;
@@ -16,32 +38,29 @@ using namespace llvm;
 /// Utility to read an input stream line-by-line.
 class LineReader {
 public:
-  LineReader() = delete;
-  LineReader(const LineReader &) = delete;
-  LineReader(LineReader &&) = delete;
-  LineReader &operator=(const LineReader &) = delete;
-  LineReader &operator=(LineReader &&) = delete;
-
   explicit LineReader(FILE *const File) : File(File) {}
 
-  ~LineReader() {
-    if (Buf)
-      free(Buf);
-  }
+  std::string readLine() {
+    std::string Result;
+    llvm::raw_string_ostream ResultWriter(Result);
 
-  std::optional<StringRef> readLine() {
-    const ssize_t ReadBytes = getline(&Buf, &BufLen, File);
+    constexpr size_t BufSize = 512;
+    char Buf[BufSize];
 
-    if (ReadBytes == -1)
-      return std::nullopt;
+    // Read from the file, appending to the result, until a new line character
+    // is found.
+    while (std::fgets(Buf, BufSize, File)) {
+      ResultWriter << Buf;
 
-    return StringRef(Buf, static_cast<size_t>(ReadBytes));
+      if (std::strchr(Buf, '\n'))
+        break;
+    }
+
+    return Result;
   }
 
 private:
   FILE *File;
-  char *Buf = nullptr;
-  size_t BufLen = 0;
 };
 
 /// This should only be used before the status pipe is set up - after,
@@ -58,40 +77,41 @@ public:
         StatusPipeWriter(createStatusPipeWriter(Args)) {};
 
   int run() {
+    LineReader StdinReader(stdin);
+
     // Inform the user that the daemon is ready to receive commands.
     messageOk();
 
-    LineReader StdinReader(stdin);
+    while (true) {
+      const std::string Command = StdinReader.readLine();
+      StringRef Remaining = Command;
 
-    while (const std::optional<StringRef> CommandOpt = StdinReader.readLine()) {
-      StringRef Command = *CommandOpt;
-
-      if (Command.consume_front(CommandRun)) {
-        Command = Command.trim();
-        runTool(Command);
-      } else if (Command.consume_front(CommandInputFile)) {
-        Command = Command.trim();
-        readInputFromFile(Command);
-      } else if (Command.consume_front(CommandInputString)) {
-        Command = Command.trim();
+      if (Remaining.consume_front(CommandRun)) {
+        Remaining = Remaining.trim();
+        runTool(Remaining);
+      } else if (Remaining.consume_front(CommandInputFile)) {
+        Remaining = Remaining.trim();
+        readInputFromFile(Remaining);
+      } else if (Remaining.consume_front(CommandInputString)) {
+        Remaining = Remaining.trim();
 
         // Read number of bytes.
         size_t Len;
-        const bool Err = Command.consumeInteger(10, Len);
+        const bool Err = Remaining.consumeInteger(10, Len);
         if (Err) {
           exitWithError("Expected integer length after " + CommandInputString);
         }
-        if (!Command.trim().empty()) {
-          exitWithError("Unexpected trailing characters in command: " + *CommandOpt);
+        if (!Remaining.trim().empty()) {
+          exitWithError("Unexpected trailing characters in command: " + Command);
         }
         messageOk();
 
         readInputFromStdin(Len);
-      } else if (Command.consume_front(CommandExit)) {
+      } else if (Remaining.consume_front(CommandExit)) {
         break;
-      } else if (Command.consume_front(CommandRedirectStderrToStdout)) {
-        if (!Command.trim().empty()) {
-          exitWithError("Unexpected trailing characters in command: " + *CommandOpt);
+      } else if (Remaining.consume_front(CommandRedirectStderrToStdout)) {
+        if (!Remaining.trim().empty()) {
+          exitWithError("Unexpected trailing characters in command: " + Command);
         }
         redirectStderrToStdout();
       } else {
@@ -126,7 +146,7 @@ private:
 
 #ifdef _WIN32
       // Convert Windows file handle to CRT file descriptor.
-      Fd = _open_osfhandle(Fd);
+      Fd = _open_osfhandle(Fd, 0);
 #endif
     }
 
@@ -221,10 +241,10 @@ private:
     llvm::errs().flush();
 
     // Store a copy of the original file so that it can be reset later.
-    StderrCopy = dup(STDERR_FILENO);
+    StderrCopy = DUP_FN(STDERR_FILENO);
 
     // Close stderr and open it to stdout.
-    dup2(STDOUT_FILENO, STDERR_FILENO);
+    DUP2_FN(STDOUT_FILENO, STDERR_FILENO);
 
     StderrRedirectedToStdout = true;
   }
@@ -235,10 +255,10 @@ private:
     llvm::errs().flush();
 
     // Close stderr and open it to the original stderr.
-    dup2(*StderrCopy, STDERR_FILENO);
+    DUP2_FN(*StderrCopy, STDERR_FILENO);
 
     // The copied stderr file descriptor is no longer needed.
-    close(*StderrCopy);
+    CLOSE_FN(*StderrCopy);
 
     StderrCopy = std::nullopt;
     StderrRedirectedToStdout = false;
