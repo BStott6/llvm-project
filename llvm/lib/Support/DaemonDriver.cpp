@@ -22,7 +22,7 @@ public:
   LineReader &operator=(const LineReader &) = delete;
   LineReader &operator=(LineReader &&) = delete;
 
-  explicit LineReader(FILE *File) : File(File) {}
+  explicit LineReader(FILE *const File) : File(File) {}
 
   ~LineReader() {
     if (Buf)
@@ -30,7 +30,7 @@ public:
   }
 
   std::optional<StringRef> readLine() {
-    ssize_t ReadBytes = getline(&Buf, &BufLen, File);
+    const ssize_t ReadBytes = getline(&Buf, &BufLen, File);
 
     if (ReadBytes == -1)
       return std::nullopt;
@@ -53,7 +53,7 @@ private:
 
 class DaemonDriver {
 public:
-  DaemonDriver(ToolInvokeFn InvokeTool, ArrayRef<const char *> Args)
+  DaemonDriver(const ToolInvokeFn InvokeTool, const ArrayRef<const char *> Args)
       : InvokeTool(InvokeTool),
         StatusPipeWriter(createStatusPipeWriter(Args)) {};
 
@@ -113,7 +113,7 @@ private:
   static constexpr StringRef MessageReturned = "returned";
   static constexpr StringRef MessageError = "error";
 
-  static raw_fd_ostream createStatusPipeWriter(ArrayRef<const char *> Args) {
+  static raw_fd_ostream createStatusPipeWriter(const ArrayRef<const char *> Args) {
     int Fd;
 
     if (Args.size() != 3) {
@@ -131,7 +131,7 @@ private:
     }
 
     // Only close the status pipe if it is not a standard stream.
-    bool ShouldClose = Fd != STDOUT_FILENO && Fd != STDERR_FILENO;
+    const bool ShouldClose = Fd != STDOUT_FILENO && Fd != STDERR_FILENO;
 
     return raw_fd_ostream(Fd, ShouldClose, /*unbuffered=*/true);
   }
@@ -147,12 +147,12 @@ private:
     StatusPipeWriter.flush();
   }
 
-  void messageReturned(int ExitCode) {
+  void messageReturned(const int ExitCode) {
     StatusPipeWriter << MessageReturned << ' ' << ExitCode << "\n";
     StatusPipeWriter.flush();
   }
 
-  void runTool(StringRef Command) {
+  void runTool(const StringRef Command) {
     std::vector<std::string> Args = splitCommandIntoArgs(Command.trim());
 
     // Convert arguments to C strings, so that they can be passed through
@@ -165,7 +165,7 @@ private:
     }
 
     // Invoke the tool itself.
-    int ExitCode = InvokeTool(ArgsCStr, MemoryBufferRef(ToolInput, "<stdin>"));
+    const int ExitCode = InvokeTool(ArgsCStr, MemoryBufferRef(ToolInput, "<stdin>"));
 
     // Make sure the user gets all the output.
     llvm::outs().flush();
@@ -181,11 +181,11 @@ private:
     messageReturned(ExitCode);
   }
 
-  void readInputFromFile(StringRef Path) {
-    ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
+  void readInputFromFile(const StringRef Path) {
+    const ErrorOr<std::unique_ptr<MemoryBuffer>> FileOrErr =
         MemoryBuffer::getFile(Path);
 
-    if (std::error_code EC = FileOrErr.getError()) {
+    if (const std::error_code EC = FileOrErr.getError()) {
       exitWithError("Couldn't open file '" + Path + "': " + EC.message());
     }
 
@@ -194,11 +194,11 @@ private:
     messageOk();
   }
 
-  void readInputFromStdin(size_t Len) {
+  void readInputFromStdin(const size_t Len) {
     // Read `Len` bytes into `ToolInput`.
     ToolInput.clear();
     ToolInput.resize(Len);
-    size_t Read = fread(ToolInput.data(), sizeof(char), Len, stdin);
+    const size_t Read = fread(ToolInput.data(), sizeof(char), Len, stdin);
 
     // Make sure the expected number of bytes was read.
     if (Read != Len) {
@@ -209,6 +209,9 @@ private:
     messageOk();
   }
 
+  /// Redirect the `stderr` stream to point to the same file descriptor as
+  /// stdout, duplicating the original file descriptor for stderr so that it
+  /// can be reset later.
   void redirectStderrToStdout() {
     if (StderrRedirectedToStdout) {
       exitWithError("Stderr is already redirected to stdout.");
@@ -216,16 +219,27 @@ private:
     }
 
     llvm::errs().flush();
+
+    // Store a copy of the original file so that it can be reset later.
     StderrCopy = dup(STDERR_FILENO);
+
+    // Close stderr and open it to stdout.
     dup2(STDOUT_FILENO, STDERR_FILENO);
+
     StderrRedirectedToStdout = true;
   }
 
   void resetStderr() {
-    assert(StderrCopy.has_value());
+    assert(StderrRedirectedToStdout && StderrCopy.has_value());
+
     llvm::errs().flush();
+
+    // Close stderr and open it to the original stderr.
     dup2(*StderrCopy, STDERR_FILENO);
+
+    // The copied stderr file descriptor is no longer needed.
     close(*StderrCopy);
+
     StderrCopy = std::nullopt;
     StderrRedirectedToStdout = false;
   }
