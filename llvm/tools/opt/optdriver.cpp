@@ -66,6 +66,8 @@
 using namespace llvm;
 using namespace opt_tool;
 
+constexpr StringRef CommandOverview = "llvm .bc -> .bc modular optimizer and analysis printer\n";
+
 static codegen::RegisterCodeGenFlags CFG;
 static codegen::RegisterSaveStatsFlag SSF;
 
@@ -405,9 +407,6 @@ static int
 optInvoke(int argc, char **argv,
           ArrayRef<std::function<void(PassBuilder &)>> PassBuilderCallbacks,
           std::optional<MemoryBufferRef> DaemonInput) {
-  cl::ParseCommandLineOptions(
-      argc, argv, "llvm .bc -> .bc modular optimizer and analysis printer\n");
-
   SmallVector<PassPlugin, 1> PluginList;
   PassPlugins.setCallback([&](const std::string &PluginPath) {
     auto Plugin = PassPlugin::Load(PluginPath);
@@ -953,30 +952,34 @@ optMain(int argc, char **argv,
   initializeReplaceWithVeclibLegacyPass(Registry);
   initializeJMCInstrumenterPass(Registry);
 
+  initializeDaemonOptions();
+
   // Register the Target and CPU printer for --version.
   cl::AddExtraVersionPrinter(sys::printDefaultTargetAndDetectedCPU);
 
+  cl::ParseCommandLineOptions(argc, argv, CommandOverview);
+
   // To ensure bugs with command line resetting do not affect standard `opt`, we
   // avoid using `ParseCommandLineOptions` to detect `--daemon-mode`.
-  bool DaemonMode = argc >= 2 && (argv[1] == StringRef("--daemon-mode"));
-  if (DaemonMode) {
-    daemonMain(
-        [&](auto Args, auto Input) {
-          int ExitCode =
-              optInvoke(Args.size(), const_cast<char **>(Args.data()),
-                        PassBuilderCallbacks, Input);
+  if (daemonModeEnabled()) {
+    runDaemonMode(
+        [&](int InvocationArgc, char **InvocationArgv, MemoryBufferRef Input) {
+          cl::ResetAllOptionOccurrences();
+          cl::ParseCommandLineOptions(InvocationArgc, InvocationArgv,
+                                      CommandOverview);
+
+          int ExitCode = optInvoke(InvocationArgc, InvocationArgv,
+                                   PassBuilderCallbacks, Input);
 
           // Reset state for next invocation.
           if (AreStatisticsEnabled()) {
             PrintStatistics();
             ResetStatistics();
           }
-          cl::ResetAllOptionOccurrences();
           // TODO reset debug counters
 
           return ExitCode;
-        },
-        ArrayRef(argv, argc));
+        });
     return 0;
   }
 

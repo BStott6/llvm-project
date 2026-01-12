@@ -1,3 +1,4 @@
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DaemonDriver.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -35,7 +36,47 @@
 
 using namespace llvm;
 
+static bool DaemonOptionsInitialized = false;
+static bool DaemonMode;
+static int DaemonStatusFd;
+static int DaemonStatusHandle;
+
+LLVM_ABI void llvm::initializeDaemonOptions() {
+  DaemonOptionsInitialized = true;
+
+  static cl::OptionCategory DaemonCategory(
+      "Daemon Options", "Options for running tools in daemon mode");
+
+  static cl::opt<bool, true> DaemonModeOpt(
+      "daemon", cl::desc("Run this tool in daemon mode"),
+      cl::cat(DaemonCategory), cl::ReallyHidden, cl::location(DaemonMode),
+      cl::init(false));
+
+  static cl::opt<int, true> DaemonStatusFdOpt(
+      "daemon-status-fd",
+      cl::desc("File descriptor to which the daemon tool will send status "
+               "messages."),
+      cl::cat(DaemonCategory), cl::ReallyHidden, cl::location(DaemonStatusFd),
+      cl::init(-1));
+
+  static cl::opt<int, true> DaemonStatusHandleOpt(
+      "daemon-status-handle",
+      cl::desc("Windows file handle to which the daemon tool will send status "
+               "messages."),
+      cl::cat(DaemonCategory), cl::ReallyHidden,
+      cl::location(DaemonStatusHandle), cl::init(-1));
+}
+
+LLVM_ABI bool llvm::daemonModeEnabled() {
+  assert(DaemonOptionsInitialized &&
+         "`initializeDaemonOptions` must be called before `daemonModeEnabled`");
+  return DaemonMode;
+}
+
 /// Utility to read an input stream line-by-line.
+/// Can't use `std::cin` because the <iostream> header is forbidden, and can't
+/// use `std::ifstream` because there isn't a way to construct one from a file
+/// descriptor.
 class LineReader {
 public:
   explicit LineReader(FILE *const File) : File(File) {}
@@ -72,9 +113,9 @@ private:
 
 class DaemonDriver {
 public:
-  DaemonDriver(const ToolInvokeFn InvokeTool, const ArrayRef<const char *> Args)
+  DaemonDriver(const ToolInvokeFn InvokeTool, const int StatusPipeFd)
       : InvokeTool(InvokeTool),
-        StatusPipeWriter(createStatusPipeWriter(Args)) {};
+        StatusPipeWriter(createStatusPipeWriter(StatusPipeFd)) {};
 
   int run() {
     LineReader StdinReader(stdin);
@@ -133,23 +174,7 @@ private:
   static constexpr StringRef MessageReturned = "returned";
   static constexpr StringRef MessageError = "error";
 
-  static raw_fd_ostream createStatusPipeWriter(const ArrayRef<const char *> Args) {
-    int Fd;
-
-    if (Args.size() != 3) {
-      reportInitError("Expected two arguments: '--daemon-mode', then the status pipe file descriptor.");
-    } else {
-      const bool Err = StringRef(Args[2]).consumeInteger(10, Fd);
-      if (Err) {
-        reportInitError("Failed to parse file descriptor from second argument.");
-      }
-
-#ifdef _WIN32
-      // Convert Windows file handle to CRT file descriptor.
-      Fd = _open_osfhandle(Fd, 0);
-#endif
-    }
-
+  static raw_fd_ostream createStatusPipeWriter(const int Fd) {
     // Only close the status pipe if it is not a standard stream.
     const bool ShouldClose = Fd != STDOUT_FILENO && Fd != STDERR_FILENO;
 
@@ -185,7 +210,8 @@ private:
     }
 
     // Invoke the tool itself.
-    const int ExitCode = InvokeTool(ArgsCStr, MemoryBufferRef(ToolInput, "<stdin>"));
+    const int ExitCode = InvokeTool(ArgsCStr.size(), ArgsCStr.data(),
+                                    MemoryBufferRef(ToolInput, "<stdin>"));
 
     // Make sure the user gets all the output.
     llvm::outs().flush();
@@ -326,8 +352,32 @@ private:
   std::optional<int> StderrCopy;
 };
 
-LLVM_ABI int llvm::daemonMain(ToolInvokeFn InvokeTool,
-                              ArrayRef<const char *> Args) {
-  DaemonDriver Driver(InvokeTool, Args);
+LLVM_ABI int llvm::runDaemonMode(ToolInvokeFn InvokeTool) {
+
+  assert(DaemonOptionsInitialized &&
+         "`initializeDaemonOptions` must be called before `runDaemonMode`");
+
+  if (DaemonStatusFd < 0 && DaemonStatusHandle < 0) {
+    reportInitError("Must provide either `--daemon-status-fd` or `--daemon-status-handle`");
+  }
+  if (DaemonStatusFd >= 0 && DaemonStatusHandle >= 0) {
+    reportInitError("Cannot provide both `--daemon-status-fd` and `--daemon-status-handle`");
+  }
+
+#ifndef _WIN32
+  if (DaemonStatusHandle.has_value()) {
+    reportInitError("`--daemon-status-handle` should only be passed on Windows.");
+  }
+  int StatusPipeFd = DaemonStatusFd;
+#else
+  int StatusPipeFd;
+  if (DaemonStatusFd >= 0) {
+    StatusPipeFd = DaemonStatusFd;
+  } else {
+    StatusPipeFd = _open_osfhandle(DaemonStatusHandle, 0);
+  }
+#endif
+
+  DaemonDriver Driver(InvokeTool, StatusPipeFd);
   return Driver.run();
 }
