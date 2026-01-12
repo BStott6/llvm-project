@@ -960,7 +960,7 @@ optMain(int argc, char **argv,
   // avoid using `ParseCommandLineOptions` to detect `--daemon-mode`.
   bool DaemonMode = argc >= 2 && (argv[1] == StringRef("--daemon-mode"));
   if (DaemonMode) {
-    daemonMain(
+    runDaemonMode(
         [&](auto Args, auto Input) {
           int ExitCode =
               optInvoke(Args.size(), const_cast<char **>(Args.data()),

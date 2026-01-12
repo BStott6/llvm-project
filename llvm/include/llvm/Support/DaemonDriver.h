@@ -17,8 +17,16 @@ namespace llvm {
 using ToolInvokeFn =
     std::function<int(ArrayRef<const char *> Args, MemoryBufferRef Input)>;
 
+/// Sets up the daemon-related command line options. This must be called before
+/// parsing command line options, and also before `daemonModeEnabled` or
+/// `runDaemonMode`.
+LLVM_ABI void initializeDaemonOptions();
+
+/// Returns true if the `--daemon` flag was passed.
+LLVM_ABI bool daemonModeEnabled();
+
 /// TODO(BStott) document.
-LLVM_ABI int daemonMain(ToolInvokeFn InvokeTool, ArrayRef<const char *> Args);
+LLVM_ABI int runDaemonMode(ToolInvokeFn InvokeTool, ArrayRef<const char *> Args);
 } // namespace llvm
 
 #endif // LLVM_SUPPORT_DAEMONDRIVER_H
