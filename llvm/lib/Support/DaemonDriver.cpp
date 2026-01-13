@@ -365,7 +365,7 @@ LLVM_ABI int llvm::runDaemonMode(ToolInvokeFn InvokeTool) {
 
   if (DaemonStatusFd < 0 && DaemonStatusHandle < 0) {
     reportInitError(
-        "Must provide either `--daemon-status-fd` or `--daemon-status-handle`");
+        "Must provide either `--daemon-status-fd` or `--daemon-status-handle (Windows-only)`");
   }
   if (DaemonStatusFd >= 0 && DaemonStatusHandle >= 0) {
     reportInitError("Cannot provide both `--daemon-status-fd` and "
@@ -373,7 +373,7 @@ LLVM_ABI int llvm::runDaemonMode(ToolInvokeFn InvokeTool) {
   }
 
 #ifndef _WIN32
-  if (DaemonStatusHandle.has_value()) {
+  if (DaemonStatusHandle >= 0) {
     reportInitError(
         "`--daemon-status-handle` should only be passed on Windows.");
   }
