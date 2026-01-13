@@ -65,6 +65,16 @@ def set_blocking(pipefd: int, blocking: bool):
         os.set_blocking(pipefd, blocking)
 
 
+def quote_args(args: list[str]) -> list[str]:
+    def quote(arg: str):
+        if " " in arg:
+            return f"'{arg}'"
+        else:
+            return arg
+
+    return [quote(arg) for arg in args]
+
+
 class DaemonError(Exception):
     """
     Exception raised when the daemon tool sends an error message.
@@ -241,7 +251,8 @@ class DaemonTool:
         return exit_code
 
     def command_run(self, args: list[str]) -> Tuple[int, bytes, bytes]:
-        self.send_command(f"run {' '.join(args)}")
+        command_str = " ".join(quote_args(args))
+        self.send_command(f"run {command_str}")
 
         # Wait for a message on the status pipe, indicating the result of the
         # command, while continually reading all output from the daemon on
