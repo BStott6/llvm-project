@@ -212,6 +212,39 @@ def getAllCustomInprocBuiltins(
     }
 
 
+def lookupInprocBuiltin(
+    inproc_builtins: dict[str, Tuple[InprocBuiltinCallable, bool]],
+    program_path: str,
+) -> Tuple[Optional[InprocBuiltinCallable], bool]:
+    """
+    Look for an entry in the inproc builtins dict that matches the program
+    path. On non-Windows platforms, this simply looks up in the map. On
+    Windows, it accounts for path case insensitivity, forward and back slashes
+    and the optional .exe suffix.
+
+    Returns the callable for this inproc builtin, if one is found, and a bool
+    indicating whether this inproc builtin allows fallback to a regular
+    command.
+    """
+
+    if kIsWindows:
+        # This is inefficient, but the map is probably too small for it to
+        # matter.
+        def matches(path_a: str, path_b: str) -> bool:
+            def normalize(path: str):
+                return path.lower().replace("/", "\\").removesuffix(".exe")
+
+            return normalize(path_a) == normalize(path_b)
+
+        for key in inproc_builtins.keys():
+            if matches(key, program_path):
+                return inproc_builtins[key]
+
+        return (None, False)
+    else:
+        return inproc_builtins.get(program_path, (None, False))
+
+
 class TimeoutHelper(object):
     """
     Object used to helper manage enforcing a timeout in
@@ -673,13 +706,8 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
         # Expand all glob expressions
         args = expand_glob_expressions(args, cmd_shenv.cwd)
 
-        # On Windows, do our own command line quoting for better compatibility
-        # with some core utility distributions.
-        if kIsWindows:
-            args = quote_windows_command(args)
-
         # Handle in-process builtins.
-        inproc_builtin, may_fallback = inproc_builtins.get(args[0], (None, False))
+        inproc_builtin, may_fallback = lookupInprocBuiltin(inproc_builtins, args[0])
 
         error = None
         if inproc_builtin:
@@ -777,6 +805,11 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
                 executable = lit.util.which(args[0], path)
             if not executable:
                 raise InternalShellError(j, "%r: command not found" % args[0])
+
+            # On Windows, do our own command line quoting for better compatibility
+            # with some core utility distributions.
+            if kIsWindows:
+                args = quote_windows_command(args)
 
             # Handle any resource limits. We do this by launching the command with
             # a wrapper that sets the necessary limits. We use a wrapper rather than

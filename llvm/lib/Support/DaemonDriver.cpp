@@ -1,5 +1,5 @@
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DaemonDriver.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdio>
@@ -7,34 +7,37 @@
 #include <optional>
 
 #if defined _WIN32
-# include <io.h>
+#include <io.h>
 #else
-# include <unistd.h>
+#include <unistd.h>
 #endif
 
 // Standard stream fileno macros are not defined on Windows.
 #ifndef STDIN_FILENO
-# define STDIN_FILENO 0
+#define STDIN_FILENO 0
 #endif
 #ifndef STDOUT_FILENO
-# define STDOUT_FILENO 1
+#define STDOUT_FILENO 1
 #endif
 #ifndef STDERR_FILENO
-# define STDERR_FILENO 2
+#define STDERR_FILENO 2
 #endif
 
 // Windows emulated POSIX functions are prefixed by `_`.
 #ifdef _WIN32
-# define CLOSE_FN _close
-# define DUP_FN _dup
-# define DUP2_FN _dup2
+#define CLOSE_FN _close
+#define DUP_FN _dup
+#define DUP2_FN _dup2
 #else
-# define CLOSE_FN close
-# define DUP_FN dup
-# define DUP2_FN dup2
+#define CLOSE_FN close
+#define DUP_FN dup
+#define DUP2_FN dup2
 #endif
 
 using namespace llvm;
+
+constexpr int StatusInitError = 2;
+constexpr int StatusCommandError = 3;
 
 static bool DaemonOptionsInitialized = false;
 static bool DaemonMode;
@@ -108,7 +111,7 @@ private:
 /// errors are reported to the user via the status pipe.
 [[noreturn]] static void reportInitError(const Twine &Err) {
   llvm::errs() << "[daemon] error: " << Err << "\n";
-  std::exit(1);
+  std::exit(StatusInitError);
 }
 
 class DaemonDriver {
@@ -140,10 +143,12 @@ public:
         size_t Len;
         const bool Err = Remaining.consumeInteger(10, Len);
         if (Err) {
-          exitWithError("Expected integer length after " + CommandInputString);
+          reportCommandError("Expected integer length after " +
+                             CommandInputString);
         }
         if (!Remaining.trim().empty()) {
-          exitWithError("Unexpected trailing characters in command: " + Command);
+          reportCommandError("Unexpected trailing characters in command: " +
+                             Command);
         }
         messageOk();
 
@@ -152,11 +157,12 @@ public:
         break;
       } else if (Remaining.consume_front(CommandRedirectStderrToStdout)) {
         if (!Remaining.trim().empty()) {
-          exitWithError("Unexpected trailing characters in command: " + Command);
+          reportCommandError("Unexpected trailing characters in command: " +
+                             Command);
         }
         redirectStderrToStdout();
       } else {
-        exitWithError("Unexpected command: " + Command);
+        reportCommandError("Unexpected command: " + Command);
       }
     }
 
@@ -168,7 +174,8 @@ private:
   static constexpr StringRef CommandInputFile = "in.file";
   static constexpr StringRef CommandInputString = "in.str";
   static constexpr StringRef CommandExit = "exit";
-  static constexpr StringRef CommandRedirectStderrToStdout = "redirect_stderr_to_stdout";
+  static constexpr StringRef CommandRedirectStderrToStdout =
+      "redirect_stderr_to_stdout";
 
   static constexpr StringRef MessageOk = "ok";
   static constexpr StringRef MessageReturned = "returned";
@@ -181,10 +188,10 @@ private:
     return raw_fd_ostream(Fd, ShouldClose, /*unbuffered=*/true);
   }
 
-  [[noreturn]] void exitWithError(const Twine &Err) {
+  [[noreturn]] void reportCommandError(const Twine &Err) {
     StatusPipeWriter << MessageError << ' ' << Err << "\n";
     StatusPipeWriter.flush();
-    std::exit(1);
+    std::exit(StatusCommandError);
   }
 
   void messageOk() {
@@ -232,7 +239,7 @@ private:
         MemoryBuffer::getFile(Path);
 
     if (const std::error_code EC = FileOrErr.getError()) {
-      exitWithError("Couldn't open file '" + Path + "': " + EC.message());
+      reportCommandError("Couldn't open file '" + Path + "': " + EC.message());
     }
 
     ToolInput = FileOrErr.get()->getMemBufferRef().getBuffer();
@@ -248,8 +255,8 @@ private:
 
     // Make sure the expected number of bytes was read.
     if (Read != Len) {
-      exitWithError("Missing bytes for '" + CommandInputString + "': expected " +
-                   Twine(Len) + " got " + Twine(Read));
+      reportCommandError("Missing bytes for '" + CommandInputString +
+                         "': expected " + Twine(Len) + " got " + Twine(Read));
     }
 
     messageOk();
@@ -260,7 +267,7 @@ private:
   /// can be reset later.
   void redirectStderrToStdout() {
     if (StderrRedirectedToStdout) {
-      exitWithError("Stderr is already redirected to stdout.");
+      reportCommandError("Stderr is already redirected to stdout.");
       std::exit(1);
     }
 
@@ -291,8 +298,7 @@ private:
   }
 
   /// Splits a command string into arguments.
-  std::vector<std::string>
-  splitCommandIntoArgs(const StringRef Command) {
+  std::vector<std::string> splitCommandIntoArgs(const StringRef Command) {
     std::vector<std::string> Args;
     std::optional<char> OuterQuote; // " or '
     std::string CurrentArgSoFar;    // Argument parsed so far
@@ -335,7 +341,7 @@ private:
       LastChar = Char;
     }
     if (OuterQuote) {
-      exitWithError("Unterminated quotes in command.");
+      reportCommandError("Unterminated quotes in command.");
       std::exit(1);
     }
     if (!CurrentArgSoFar.empty()) {
@@ -358,24 +364,27 @@ LLVM_ABI int llvm::runDaemonMode(ToolInvokeFn InvokeTool) {
          "`initializeDaemonOptions` must be called before `runDaemonMode`");
 
   if (DaemonStatusFd < 0 && DaemonStatusHandle < 0) {
-    reportInitError("Must provide either `--daemon-status-fd` or `--daemon-status-handle`");
+    reportInitError(
+        "Must provide either `--daemon-status-fd` or `--daemon-status-handle`");
   }
   if (DaemonStatusFd >= 0 && DaemonStatusHandle >= 0) {
-    reportInitError("Cannot provide both `--daemon-status-fd` and `--daemon-status-handle`");
+    reportInitError("Cannot provide both `--daemon-status-fd` and "
+                    "`--daemon-status-handle`");
   }
 
 #ifndef _WIN32
   if (DaemonStatusHandle.has_value()) {
-    reportInitError("`--daemon-status-handle` should only be passed on Windows.");
+    reportInitError(
+        "`--daemon-status-handle` should only be passed on Windows.");
   }
-  int StatusPipeFd = DaemonStatusFd;
+  const int StatusPipeFd = DaemonStatusFd;
 #else
-  int StatusPipeFd;
-  if (DaemonStatusFd >= 0) {
-    StatusPipeFd = DaemonStatusFd;
-  } else {
-    StatusPipeFd = _open_osfhandle(DaemonStatusHandle, 0);
-  }
+  const int StatusPipeFd = [] {
+    if (DaemonStatusHandle >= 0) {
+      return _open_osfhandle(DaemonStatusHandle, 0);
+    }
+    return DaemonStatusFd;
+  }();
 #endif
 
   DaemonDriver Driver(InvokeTool, StatusPipeFd);
