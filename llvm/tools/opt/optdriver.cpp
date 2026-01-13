@@ -404,7 +404,7 @@ static bool shouldForceLegacyPM() {
 }
 
 static int
-optInvoke(int argc, char **argv,
+runOpt(int argc, char **argv,
           ArrayRef<std::function<void(PassBuilder &)>> PassBuilderCallbacks,
           std::optional<MemoryBufferRef> DaemonInput) {
   SmallVector<PassPlugin, 1> PluginList;
@@ -962,13 +962,13 @@ optMain(int argc, char **argv,
   // To ensure bugs with command line resetting do not affect standard `opt`, we
   // avoid using `ParseCommandLineOptions` to detect `--daemon-mode`.
   if (daemonModeEnabled()) {
-    runDaemonMode(
+    return runDaemonMode(
         [&](int InvocationArgc, char **InvocationArgv, MemoryBufferRef Input) {
           cl::ResetAllOptionOccurrences();
           cl::ParseCommandLineOptions(InvocationArgc, InvocationArgv,
                                       CommandOverview);
 
-          int ExitCode = optInvoke(InvocationArgc, InvocationArgv,
+          int ExitCode = runOpt(InvocationArgc, InvocationArgv,
                                    PassBuilderCallbacks, Input);
 
           // Reset state for next invocation.
@@ -980,8 +980,7 @@ optMain(int argc, char **argv,
 
           return ExitCode;
         });
-    return 0;
   }
 
-  return optInvoke(argc, argv, PassBuilderCallbacks, std::nullopt);
+  return runOpt(argc, argv, PassBuilderCallbacks, std::nullopt);
 }

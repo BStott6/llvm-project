@@ -17,6 +17,7 @@
 
 #include "llvm/FileCheck/FileCheck.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/DaemonDriver.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
@@ -728,15 +729,8 @@ static void DumpAnnotatedInput(raw_ostream &OS, const FileCheckRequest &Req,
   OS << ">>>>>>\n";
 }
 
-int main(int argc, char **argv) {
-  // Enable use of ANSI color codes because FileCheck is using them to
-  // highlight text.
-  llvm::sys::Process::UseANSIEscapeCodes(true);
-
-  InitLLVM X(argc, argv);
-  cl::ParseCommandLineOptions(argc, argv, /*Overview*/ "", /*Errs*/ nullptr,
-                              /*VFS*/ nullptr, "FILECHECK_OPTS");
-
+static int runFileCheck(int argc, char **argv,
+                        std::optional<MemoryBufferRef> DaemonInput) {
   // Select -dump-input* values.  The -help documentation specifies the default
   // value and which value to choose if an option is specified multiple times.
   // In the latter case, the general rule of thumb is to choose the value that
@@ -830,28 +824,36 @@ int main(int argc, char **argv) {
     return 2;
 
   // Open the file to check and add it to SourceMgr.
-  ErrorOr<std::unique_ptr<MemoryBuffer>> InputFileOrErr =
-      MemoryBuffer::getFileOrSTDIN(InputFilename, /*IsText=*/true);
-  if (InputFilename == "-")
-    InputFilename = "<stdin>"; // Overwrite for improved diagnostic messages
-  if (std::error_code EC = InputFileOrErr.getError()) {
-    errs() << "Could not open input file '" << InputFilename
-           << "': " << EC.message() << '\n';
-    return 2;
+  std::unique_ptr<MemoryBuffer> InputFile;
+  if (DaemonInput && InputFilename == "-") {
+    InputFile = WritableMemoryBuffer::getNewUninitMemBuffer(
+        DaemonInput->getBufferSize(), DaemonInput->getBufferIdentifier());
+    std::copy(DaemonInput->getBufferStart(), DaemonInput->getBufferEnd(),
+              const_cast<char *>(InputFile->getBufferStart()));
+  } else {
+    ErrorOr<std::unique_ptr<MemoryBuffer>> InputFileOrErr =
+        MemoryBuffer::getFileOrSTDIN(InputFilename, /*IsText=*/true);
+    if (InputFilename == "-")
+      InputFilename = "<stdin>"; // Overwrite for improved diagnostic messages
+    if (std::error_code EC = InputFileOrErr.getError()) {
+      errs() << "Could not open input file '" << InputFilename
+             << "': " << EC.message() << '\n';
+      return 2;
+    }
+    InputFile = std::move(InputFileOrErr.get());
   }
-  MemoryBuffer &InputFile = *InputFileOrErr.get();
 
-  if (InputFile.getBufferSize() == 0 && !AllowEmptyInput) {
+  if (InputFile->getBufferSize() == 0 && !AllowEmptyInput) {
     errs() << "FileCheck error: '" << InputFilename << "' is empty.\n";
     DumpCommandLine(argc, argv);
     return 2;
   }
 
   SmallString<4096> InputFileBuffer;
-  StringRef InputFileText = FC.CanonicalizeFile(InputFile, InputFileBuffer);
+  StringRef InputFileText = FC.CanonicalizeFile(*InputFile, InputFileBuffer);
 
   SM.AddNewSourceBuffer(MemoryBuffer::getMemBuffer(
-                            InputFileText, InputFile.getBufferIdentifier()),
+                            InputFileText, InputFile->getBufferIdentifier()),
                         SMLoc());
 
   std::vector<FileCheckDiag> Diags;
@@ -876,4 +878,29 @@ int main(int argc, char **argv) {
   }
 
   return ExitCode;
+}
+
+int main(int argc, char **argv) {
+  // Enable use of ANSI color codes because FileCheck is using them to
+  // highlight text.
+  llvm::sys::Process::UseANSIEscapeCodes(true);
+
+  InitLLVM X(argc, argv);
+
+  initializeDaemonOptions();
+
+  cl::ParseCommandLineOptions(argc, argv, /*Overview*/ "", /*Errs*/ nullptr,
+                              /*VFS*/ nullptr, "FILECHECK_OPTS");
+
+  if (daemonModeEnabled()) {
+    return runDaemonMode(
+        [&](int InvocationArgc, char **InvocationArgv, MemoryBufferRef Input) {
+          cl::ResetAllOptionOccurrences();
+          cl::ParseCommandLineOptions(InvocationArgc, InvocationArgv);
+
+          return runFileCheck(InvocationArgc, InvocationArgv, Input);
+        });
+  }
+
+  return runFileCheck(argc, argv, std::nullopt);
 }

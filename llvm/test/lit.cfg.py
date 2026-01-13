@@ -52,7 +52,11 @@ config.excludes = ["Inputs", "CMakeLists.txt", "README.txt", "LICENSE.txt"]
 # TODO(BStott) better comment explaining this
 daemon_tools_module = os.path.join(config.llvm_src_root, "utils/lit/lit/llvm/daemon_tool.py")
 lit_config.inproc_builtins = {
-    os.path.join(config.llvm_tools_dir, "opt"): (daemon_tools_module, "invoke_llvm_daemon_tool", True)
+    os.path.join(config.llvm_tools_dir, tool_name): (daemon_tools_module, "invoke_llvm_daemon_tool", True)
+    for tool_name in [
+        "opt",
+        "FileCheck",
+    ]
 }
 
 if config.enable_profcheck:
