@@ -513,6 +513,12 @@ std::error_code llvm::sys::ChangeStdoutMode(fs::OpenFlags Flags) {
   return std::error_code();
 }
 
+std::error_code llvm::sys::ChangeStderrMode(fs::OpenFlags Flags) {
+  if (!(Flags & fs::OF_Text))
+    return ChangeStderrToBinary();
+  return std::error_code();
+}
+
 std::error_code llvm::sys::ChangeStdinToBinary() {
 #ifdef __MVS__
   return disableAutoConversion(STDIN_FILENO);
@@ -523,6 +529,11 @@ std::error_code llvm::sys::ChangeStdinToBinary() {
 }
 
 std::error_code llvm::sys::ChangeStdoutToBinary() {
+  // Do nothing, as Unix doesn't differentiate between text and binary.
+  return std::error_code();
+}
+
+std::error_code llvm::sys::ChangeStderrToBinary() {
   // Do nothing, as Unix doesn't differentiate between text and binary.
   return std::error_code();
 }

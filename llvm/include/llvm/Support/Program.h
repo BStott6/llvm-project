@@ -79,17 +79,19 @@ struct ProcessStatistics {
 LLVM_ABI ErrorOr<std::string> findProgramByName(StringRef Name,
                                                 ArrayRef<StringRef> Paths = {});
 
-// These functions change the specified standard stream (stdin or stdout) mode
-// based on the Flags. They return errc::success if the specified stream was
-// changed. Otherwise, a platform dependent error is returned.
+// These functions change the specified standard stream (stdin, stdout or
+// stderr) mode based on the Flags. They return errc::success if the specified
+// stream was changed. Otherwise, a platform dependent error is returned.
 LLVM_ABI std::error_code ChangeStdinMode(fs::OpenFlags Flags);
 LLVM_ABI std::error_code ChangeStdoutMode(fs::OpenFlags Flags);
+LLVM_ABI std::error_code ChangeStderrMode(fs::OpenFlags Flags);
 
-// These functions change the specified standard stream (stdin or stdout) to
-// binary mode. They return errc::success if the specified stream
-// was changed. Otherwise a platform dependent error is returned.
+// These functions change the specified standard stream (stdin, stdout or
+// stderr) to binary mode. They return errc::success if the specified stream was
+// changed. Otherwise a platform dependent error is returned.
 LLVM_ABI std::error_code ChangeStdinToBinary();
 LLVM_ABI std::error_code ChangeStdoutToBinary();
+LLVM_ABI std::error_code ChangeStderrToBinary();
 
 /// This function executes the program using the arguments provided.  The
 /// invoked program will inherit the stdin, stdout, and stderr file

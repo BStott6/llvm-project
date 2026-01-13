@@ -11,6 +11,13 @@ from lit.InprocBuiltins import InprocBuiltinIO
 from lit.ShCommands import Command
 from lit.ShellEnvironment import ShellEnvironment, InternalShellError, kIsWindows, updateEnv
 
+
+debug = False
+"""
+Output a trace of data sent to and received from the daemon process.
+"""
+
+
 if kIsWindows:
     import msvcrt
 
@@ -28,6 +35,8 @@ def async_read_status_pipe(daemon):
 
     while daemon.is_alive():
         line = daemon.status_pipe.readline()
+        if debug:
+            print("from status pipe:", line)
         daemon.status_pipe_queue.put(line)
     daemon.status_pipe_queue.put(b"")
 
@@ -143,7 +152,8 @@ class DaemonTool:
         if self.status_pipe_reader_thread:
             self.status_pipe_reader_thread.join()
 
-        # Clear 
+        # Clear the status pipe queue, to avoid issues caused by lingering
+        # messages.
         self.status_pipe_queue = Queue()
 
         # Create a new status pipe for the daemon process.
@@ -233,10 +243,14 @@ class DaemonTool:
         # Run the tool.
         (exit_code, stdout_bytes, stderr_bytes) = self.command_run(args)
 
-        stdout.write(stdout_bytes)
-        stdout.flush()
-        stderr.write(stderr_bytes)
-        stderr.flush()
+        if stderr == stdout:
+            stdout.write(stdout_bytes)
+            stdout.flush()
+        else:
+            stdout.write(stdout_bytes)
+            stdout.flush()
+            stderr.write(stderr_bytes)
+            stderr.flush()
 
         return exit_code
 
@@ -301,7 +315,7 @@ class DaemonTool:
             if not chunk:
                 break
             output += chunk
-        
+
         return output
 
     def command_input_file(self, path: str):
@@ -316,6 +330,8 @@ class DaemonTool:
         self.check_ok()
 
     def send_command(self, command: str):
+        if debug:
+            print("sending command", command)
         self.daemon_proc.stdin.write(f"{command}\n".encode())
         self.daemon_proc.stdin.flush()
 
@@ -342,8 +358,11 @@ class DaemonTool:
         """
 
         if not message:
+            # On Windows, we must change these streams back to blocking mode
+            # for the output to be captured by `communicate()`.
             set_blocking(self.daemon_proc.stdout.fileno(), True)
             set_blocking(self.daemon_proc.stderr.fileno(), True)
+
             stdout, stderr = self.daemon_proc.communicate()
             raise DaemonExited(self.daemon_proc.returncode, stdout, stderr)
 

@@ -1,6 +1,7 @@
 #include "llvm/Support/DaemonDriver.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdio>
 #include <cstdlib>
@@ -359,6 +360,11 @@ private:
 };
 
 LLVM_ABI int llvm::runDaemonMode(ToolInvokeFn InvokeTool) {
+  // Make sure all IO streams are in binary mode, so that line ending characters
+  // are not modified on Windows.
+  sys::ChangeStdinToBinary();
+  sys::ChangeStdoutToBinary();
+  sys::ChangeStderrToBinary();
 
   assert(DaemonOptionsInitialized &&
          "`initializeDaemonOptions` must be called before `runDaemonMode`");

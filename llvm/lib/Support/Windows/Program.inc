@@ -505,6 +505,12 @@ std::error_code llvm::sys::ChangeStdoutMode(sys::fs::OpenFlags Flags) {
   return std::error_code();
 }
 
+std::error_code llvm::sys::ChangeStderrMode(sys::fs::OpenFlags Flags) {
+  if (!(Flags & fs::OF_CRLF))
+    return ChangeStderrToBinary();
+  return std::error_code();
+}
+
 std::error_code sys::ChangeStdinToBinary() {
   int result = _setmode(_fileno(stdin), _O_BINARY);
   if (result == -1)
@@ -514,6 +520,13 @@ std::error_code sys::ChangeStdinToBinary() {
 
 std::error_code sys::ChangeStdoutToBinary() {
   int result = _setmode(_fileno(stdout), _O_BINARY);
+  if (result == -1)
+    return errnoAsErrorCode();
+  return std::error_code();
+}
+
+std::error_code sys::ChangeStderrToBinary() {
+  int result = _setmode(_fileno(stderr), _O_BINARY);
   if (result == -1)
     return errnoAsErrorCode();
   return std::error_code();

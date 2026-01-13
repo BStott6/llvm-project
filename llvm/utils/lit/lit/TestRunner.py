@@ -769,6 +769,9 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, customInprocBuiltins={}):
             # Run the inproc builtin.
             exit_code = inproc_builtin(command, args_expanded, cmd_shenv, builtin_io)
 
+            if stderrRedirectedToStdout:
+                builtin_io.stderr = io.BytesIO()
+
             # Make sure that the output is flushed, in case the next process
             # tries to read it from a file (as our handles to these files don't
             # close, they are not guarranteed to be flushed).
