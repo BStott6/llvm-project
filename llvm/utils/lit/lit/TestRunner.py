@@ -330,7 +330,7 @@ def invoke_process(
     stdin: Any,
     stdout: Any,
     stderr: Any,
-    piped_input: Optional[bytes],
+    piped_input: bytes | None,
     shenv: ShellEnvironment,
     cmd_shenv: ShellEnvironment,
     stderrIsStdout: bool,
@@ -562,75 +562,33 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
             else:
                 break
 
-        # Handle in-process builtins.
-        #
-        # Handle "echo" as a builtin if it is not part of a pipeline. This
-        # greatly speeds up tests that construct input files by repeatedly
-        # echo-appending to a file.
-        # FIXME: Standardize on the builtin echo implementation. We can use a
-        # temporary file to sidestep blocking pipe write issues.
-
         # Ensure args[0] is hashable.
         args[0] = expand_glob(args[0], cmd_shenv.cwd)[0]
 
+        # Decide if this command can be run as an in-process builtin. The second
+        # element tells us whether this command can fallback to a regular command
+        # invocation in cases where in-process builtins don't make sense
+        # (e.g. with `not --crash`).
+
+        # FIXME: Standardize on the builtin echo implementation. We can use a
+        # temporary file to sidestep blocking pipe write issues.
         inproc_builtin = inproc_builtins.get(args[0], None)
-        if inproc_builtin and (args[0] != "echo" or len(cmd.commands) == 1):
-            # env calling an in-process builtin is useless, so we take the safe
-            # approach of complaining.
-            if not cmd_shenv is shenv:
-                raise InternalShellError(
-                    j, "Error: 'env' cannot call '{}'".format(args[0])
-                )
+
+        error = None
+        if inproc_builtin:
+            # not --crash cannot call in-process builtins.
             if not_crash:
-                raise InternalShellError(
-                    j, "Error: 'not --crash' cannot call" " '{}'".format(args[0])
-                )
-            if len(cmd.commands) != 1:
-                raise InternalShellError(
-                    j,
-                    "Unsupported: '{}' cannot be part" " of a pipeline".format(args[0]),
-                )
+                error = "Error: 'not --crash' cannot call" " '{}'".format(args[0])
+            # env cannot call in-process builtins.
+            if not cmd_shenv is shenv:
+                error = "Error: 'env' cannot call '{}'".format(args[0])
 
-            stdin, stdout, stderr = processRedirects(
-                j, subprocess.PIPE, shenv, opened_files
-            )
-
-            args = expand_glob_expressions(args, cmd_shenv.cwd)
-
-            invocation = invoke_inproc_builtin(
-                inproc_builtin,
-                j,
-                args,
-                stdin,
-                stdout,
-                stderr,
-                cmd_shenv,
-            )
-
-            if not_count % 2:
-                invocation.result.exit_code = int(not invocation.result.exit_code)
-
-            # Gather output from the streams.
-            out = ""
-            if stdout == subprocess.PIPE:
-                invocation.result.stdout.seek(0)
-                out = invocation.result.stdout.read().decode("utf8", "replace")
-
-            err = ""
-            if stderr == subprocess.PIPE:
-                invocation.result.stderr.seek(0)
-                err = invocation.result.stderr.read().decode("utf8", "replace")
-
-            result = ShellCommandResult(
-                j,
-                out,
-                err,
-                invocation.result.exit_code,
-                False,
-            )
-            result.command.args = j.args
-            results.append(result)
-            return result.exitCode
+            if error:
+                if inproc_builtin.fallback is not None:
+                    args[0] = inproc_builtin.fallback
+                    inproc_builtin = None
+                else:
+                    raise InternalShellError(j, error)
 
         # Resolve any out-of-process builtin command before adding back 'not'
         # commands.
@@ -673,26 +631,61 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
         else:
             stderrIsStdout = False
 
+        # Replace uses of /dev/null with temporary files.
+        if kAvoidDevNull:
+            for arg_index, arg in enumerate(args):
+                if isinstance(arg, str) and kDevNull in arg:
+                    f = tempfile.NamedTemporaryFile(delete=False)
+                    f.close()
+                    named_temp_files.append(f.name)
+                    args[arg_index] = arg.replace(kDevNull, f.name)
+
+        # Expand all glob expressions
         args = expand_glob_expressions(args, cmd_shenv.cwd)
 
-        invocations.append(
-            invoke_process(
-                cmd,
-                j,
-                i,
-                args,
-                stdin,
-                stdout,
-                stderr,
-                None,
-                shenv,
-                cmd_shenv,
-                stderrIsStdout,
-                stderrTempFiles,
-                builtin_commands_dir,
-                timeoutHelper,
+        if inproc_builtin:
+            invocations.append(
+                invoke_inproc_builtin(
+                    inproc_builtin,
+                    j,
+                    args,
+                    stdin,
+                    stdout,
+                    stderr,
+                    cmd_shenv,
+                )
             )
-        )
+        else:
+            # If the stdin source is the output stream of a in-process
+            # builtin, read it in order to provide it to the process.
+            piped_input = None
+            if (
+                invocations
+                and isinstance(invocations[-1], InprocBuiltinInvocation)
+                and stdin is not None
+                and stdin != subprocess.PIPE
+            ):
+                piped_input = stdin.read()
+                stdin = subprocess.PIPE
+
+            invocations.append(
+                invoke_process(
+                    cmd,
+                    j,
+                    i,
+                    args,
+                    stdin,
+                    stdout,
+                    stderr,
+                    piped_input,
+                    shenv,
+                    cmd_shenv,
+                    stderrIsStdout,
+                    stderrTempFiles,
+                    builtin_commands_dir,
+                    timeoutHelper,
+                )
+            )
 
         proc_not_counts.append(not_count)
         if not not_crash and not_args == ["not"]:

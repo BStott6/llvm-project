@@ -1,0 +1,4 @@
+Check that env cannot call in-process builtins that don't have
+a specified fallback command.
+
+RUN: env returns_0

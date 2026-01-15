@@ -1,0 +1,6 @@
+Check that when called with `not --crash` or `env` in-process builtins with a
+provided "fallback" command can fall back to that command.
+
+RUN: echo "hello123" > %t
+RUN: not not --crash fallback_to_grep < %t "123"
+RUN: env fallback_to_grep < %t "123"

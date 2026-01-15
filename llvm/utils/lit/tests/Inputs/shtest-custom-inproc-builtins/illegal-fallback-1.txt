@@ -1,0 +1,4 @@
+Check that not --crash cannot call in-process builtins that don't have
+a specified fallback command.
+
+RUN: not not --crash returns_0
