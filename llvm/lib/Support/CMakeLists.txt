@@ -244,6 +244,7 @@ add_llvm_component_library(LLVMSupport
   RISCVAttributeParser.cpp
   RISCVISAUtils.cpp
   ScaledNumber.cpp
+  ScopedFileRedirect.cpp
   ScopedPrinter.cpp
   SHA1.cpp
   SHA256.cpp

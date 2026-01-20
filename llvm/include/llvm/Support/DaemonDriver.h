@@ -1,32 +1,23 @@
-// TODO(BStott) file header
+//===- llvm/Support/DaemonDriver.h - Daemon driver interface ----*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// TODO document me
+//
+//===----------------------------------------------------------------------===//
 
 #ifndef LLVM_SUPPORT_DAEMONDRIVER_H
 #define LLVM_SUPPORT_DAEMONDRIVER_H
 
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/Compiler.h"
-#include "llvm/Support/MemoryBufferRef.h"
-#include <functional>
+#include "llvm/Support/ToolInterface.h"
 
 namespace llvm {
-/// "Main" function for a tool invoked by the daemon. This should not call
-/// `InitLLVM`; this should be run before `daemonMain`. The invoke function is
-/// responsible for resetting any managed global state, for example statistics
-/// and debug counters, to prevent any state from leaking to the next
-/// invocation.
-using ToolInvokeFn =
-    std::function<int(int Argc, char **Argv, MemoryBufferRef Input)>;
-
-/// Sets up the daemon-related command line options. This must be called before
-/// parsing command line options, and also before `daemonModeEnabled` or
-/// `runDaemonMode`.
-LLVM_ABI void initializeDaemonOptions();
-
-/// Returns true if the `--daemon` flag was passed.
-LLVM_ABI bool daemonModeEnabled();
-
-/// TODO(BStott) document.
-LLVM_ABI int runDaemonMode(ToolInvokeFn InvokeTool);
+LLVM_ABI int runWithDaemonSupport(LLVMTool &Tool, int Argc, char **Argv);
 } // namespace llvm
 
 #endif // LLVM_SUPPORT_DAEMONDRIVER_H

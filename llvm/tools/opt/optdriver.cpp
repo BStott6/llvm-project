@@ -1,3 +1,4 @@
+//
 //===- optdriver.cpp - The LLVM Modular Optimizer -------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -51,6 +52,7 @@
 #include "llvm/Support/SystemUtils.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/ToolInterface.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/YAMLTraits.h"
 #include "llvm/Target/TargetMachine.h"
@@ -65,8 +67,6 @@
 #include <optional>
 using namespace llvm;
 using namespace opt_tool;
-
-constexpr StringRef CommandOverview = "llvm .bc -> .bc modular optimizer and analysis printer\n";
 
 static codegen::RegisterCodeGenFlags CFG;
 static codegen::RegisterSaveStatsFlag SSF;
@@ -403,505 +403,524 @@ static bool shouldForceLegacyPM() {
   return false;
 }
 
-static int
-runOpt(int argc, char **argv,
-          ArrayRef<std::function<void(PassBuilder &)>> PassBuilderCallbacks,
-          std::optional<MemoryBufferRef> DaemonInput) {
-  SmallVector<PassPlugin, 1> PluginList;
-  PassPlugins.setCallback([&](const std::string &PluginPath) {
-    auto Plugin = PassPlugin::Load(PluginPath);
-    if (!Plugin)
-      reportFatalUsageError(Plugin.takeError());
-    PluginList.emplace_back(Plugin.get());
-  });
+class OptTool : public LLVMTool {
+public:
+  explicit OptTool(
+      ArrayRef<std::function<void(PassBuilder &)>> PassBuilderCallbacks)
+      : PassBuilderCallbacks(PassBuilderCallbacks) {}
 
-  LLVMContext Context;
+  virtual int run(int Argc, char **Argv,
+                  std::optional<MemoryBufferRef> StdinOverride) override {
+    SmallVector<PassPlugin, 1> PluginList;
+    PassPlugins.setCallback([&](const std::string &PluginPath) {
+      auto Plugin = PassPlugin::Load(PluginPath);
+      if (!Plugin)
+        reportFatalUsageError(Plugin.takeError());
+      PluginList.emplace_back(Plugin.get());
+    });
 
-  // TODO: remove shouldForceLegacyPM().
-  const bool UseNPM = (!EnableLegacyPassManager && !shouldForceLegacyPM()) ||
-                      PassPipeline.getNumOccurrences() > 0;
+    LLVMContext Context;
 
-  if (UseNPM && !PassList.empty()) {
-    errs() << "The `opt -passname` syntax for the new pass manager is "
-              "not supported, please use `opt -passes=<pipeline>` (or the `-p` "
-              "alias for a more concise version).\n";
-    errs() << "See https://llvm.org/docs/NewPassManager.html#invoking-opt "
-              "for more details on the pass pipeline syntax.\n\n";
-    return 1;
-  }
+    // TODO: remove shouldForceLegacyPM().
+    const bool UseNPM = (!EnableLegacyPassManager && !shouldForceLegacyPM()) ||
+                        PassPipeline.getNumOccurrences() > 0;
 
-  if (!UseNPM && PluginList.size()) {
-    errs() << argv[0] << ": " << PassPlugins.ArgStr
-           << " specified with legacy PM.\n";
-    return 1;
-  }
-
-  // FIXME: once the legacy PM code is deleted, move runPassPipeline() here and
-  // construct the PassBuilder before parsing IR so we can reuse the same
-  // PassBuilder for print passes.
-  if (PrintPasses) {
-    printPasses(outs());
-    return 0;
-  }
-
-  TimeTracerRAII TimeTracer(argv[0]);
-
-  SMDiagnostic Err;
-
-  Context.setDiscardValueNames(DiscardValueNames);
-  if (!DisableDITypeMap)
-    Context.enableDebugTypeODRUniquing();
-
-  Expected<LLVMRemarkFileHandle> RemarksFileOrErr =
-      setupLLVMOptimizationRemarks(Context, RemarksFilename, RemarksPasses,
-                                   RemarksFormat, RemarksWithHotness,
-                                   RemarksHotnessThreshold);
-  if (Error E = RemarksFileOrErr.takeError()) {
-    errs() << toString(std::move(E)) << '\n';
-    return 1;
-  }
-  LLVMRemarkFileHandle RemarksFile = std::move(*RemarksFileOrErr);
-
-  codegen::MaybeEnableStatistics();
-
-  StringRef ABIName = mc::getABIName(); // FIXME: Handle module flag.
-
-  // Load the input module...
-  auto SetDataLayout = [&](StringRef IRTriple,
-                           StringRef IRLayout) -> std::optional<std::string> {
-    // Data layout specified on the command line has the highest priority.
-    if (!ClDataLayout.empty())
-      return ClDataLayout;
-    // If an explicit data layout is already defined in the IR, don't infer.
-    if (!IRLayout.empty())
-      return std::nullopt;
-
-    // If an explicit triple was specified (either in the IR or on the
-    // command line), use that to infer the default data layout. However, the
-    // command line target triple should override the IR file target triple.
-    std::string TripleStr =
-        TargetTriple.empty() ? IRTriple.str() : Triple::normalize(TargetTriple);
-    // If the triple string is still empty, we don't fall back to
-    // sys::getDefaultTargetTriple() since we do not want to have differing
-    // behaviour dependent on the configured default triple. Therefore, if the
-    // user did not pass -mtriple or define an explicit triple/datalayout in
-    // the IR, we should default to an empty (default) DataLayout.
-    if (TripleStr.empty())
-      return std::nullopt;
-
-    Triple TT(TripleStr);
-
-    std::string Str = TT.computeDataLayout(ABIName);
-    if (Str.empty()) {
-      errs() << argv[0]
-             << ": warning: failed to infer data layout from target triple\n";
-      return std::nullopt;
-    }
-    return Str;
-  };
-  std::unique_ptr<Module> M;
-  if (DaemonInput && InputFilename == "-") {
-    assert(!NoUpgradeDebugInfo &&
-           "TODO(BStott) support NoUpgradeDebugInfo with daemon mode");
-
-    M = parseIR(*DaemonInput, Err, Context, ParserCallbacks(SetDataLayout),
-                nullptr);
-  } else if (NoUpgradeDebugInfo) {
-    M = parseAssemblyFileWithIndexNoUpgradeDebugInfo(
-            InputFilename, Err, Context, nullptr, SetDataLayout)
-            .Mod;
-  } else {
-    M = parseIRFile(InputFilename, Err, Context,
-                    ParserCallbacks(SetDataLayout));
-  }
-
-  if (!M) {
-    Err.print(argv[0], errs());
-    return 1;
-  }
-
-  // Strip debug info before running the verifier.
-  if (StripDebug)
-    StripDebugInfo(*M);
-
-  // Erase module-level named metadata, if requested.
-  if (StripNamedMetadata) {
-    while (!M->named_metadata_empty()) {
-      NamedMDNode *NMD = &*M->named_metadata_begin();
-      M->eraseNamedMetadata(NMD);
-    }
-  }
-
-  // If we are supposed to override the target triple, do so now.
-  if (!TargetTriple.empty())
-    M->setTargetTriple(Triple(Triple::normalize(TargetTriple)));
-
-  // Immediately run the verifier to catch any problems before starting up the
-  // pass pipelines.  Otherwise we can crash on broken code during
-  // doInitialization().
-  if (!NoVerify && verifyModule(*M, &errs())) {
-    errs() << argv[0] << ": " << InputFilename
-           << ": error: input module is broken!\n";
-    return 1;
-  }
-
-  // Enable testing of whole program devirtualization on this module by invoking
-  // the facility for updating public visibility to linkage unit visibility when
-  // specified by an internal option. This is normally done during LTO which is
-  // not performed via opt.
-  updateVCallVisibilityInModule(
-      *M,
-      /*WholeProgramVisibilityEnabledInLTO=*/false,
-      // FIXME: These need linker information via a
-      // TBD new interface.
-      /*DynamicExportSymbols=*/{},
-      /*ValidateAllVtablesHaveTypeInfos=*/false,
-      /*IsVisibleToRegularObj=*/[](StringRef) { return true; });
-
-  // Figure out what stream we are supposed to write to...
-  std::unique_ptr<ToolOutputFile> Out;
-  std::unique_ptr<ToolOutputFile> ThinLinkOut;
-  if (NoOutput) {
-    if (!OutputFilename.empty())
-      errs() << "WARNING: The -o (output filename) option is ignored when\n"
-                "the --disable-output option is used.\n";
-  } else {
-    // Default to standard output.
-    if (OutputFilename.empty())
-      OutputFilename = "-";
-
-    std::error_code EC;
-    sys::fs::OpenFlags Flags =
-        OutputAssembly ? sys::fs::OF_TextWithCRLF : sys::fs::OF_None;
-    Out.reset(new ToolOutputFile(OutputFilename, EC, Flags));
-    if (EC) {
-      errs() << EC.message() << '\n';
+    if (UseNPM && !PassList.empty()) {
+      errs()
+          << "The `opt -passname` syntax for the new pass manager is "
+             "not supported, please use `opt -passes=<pipeline>` (or the `-p` "
+             "alias for a more concise version).\n";
+      errs() << "See https://llvm.org/docs/NewPassManager.html#invoking-opt "
+                "for more details on the pass pipeline syntax.\n\n";
       return 1;
     }
 
-    if (!ThinLinkBitcodeFile.empty()) {
-      ThinLinkOut.reset(
-          new ToolOutputFile(ThinLinkBitcodeFile, EC, sys::fs::OF_None));
+    if (!UseNPM && PluginList.size()) {
+      errs() << Argv[0] << ": " << PassPlugins.ArgStr
+             << " specified with legacy PM.\n";
+      return 1;
+    }
+
+    // FIXME: once the legacy PM code is deleted, move runPassPipeline() here
+    // and construct the PassBuilder before parsing IR so we can reuse the same
+    // PassBuilder for print passes.
+    if (PrintPasses) {
+      printPasses(outs());
+      return 0;
+    }
+
+    TimeTracerRAII TimeTracer(Argv[0]);
+
+    SMDiagnostic Err;
+
+    Context.setDiscardValueNames(DiscardValueNames);
+    if (!DisableDITypeMap)
+      Context.enableDebugTypeODRUniquing();
+
+    Expected<LLVMRemarkFileHandle> RemarksFileOrErr =
+        setupLLVMOptimizationRemarks(Context, RemarksFilename, RemarksPasses,
+                                     RemarksFormat, RemarksWithHotness,
+                                     RemarksHotnessThreshold);
+    if (Error E = RemarksFileOrErr.takeError()) {
+      errs() << toString(std::move(E)) << '\n';
+      return 1;
+    }
+    LLVMRemarkFileHandle RemarksFile = std::move(*RemarksFileOrErr);
+
+    codegen::MaybeEnableStatistics();
+
+    StringRef ABIName = mc::getABIName(); // FIXME: Handle module flag.
+
+    // Load the input module...
+    auto SetDataLayout = [&](StringRef IRTriple,
+                             StringRef IRLayout) -> std::optional<std::string> {
+      // Data layout specified on the command line has the highest priority.
+      if (!ClDataLayout.empty())
+        return ClDataLayout;
+      // If an explicit data layout is already defined in the IR, don't infer.
+      if (!IRLayout.empty())
+        return std::nullopt;
+
+      // If an explicit triple was specified (either in the IR or on the
+      // command line), use that to infer the default data layout. However, the
+      // command line target triple should override the IR file target triple.
+      std::string TripleStr = TargetTriple.empty()
+                                  ? IRTriple.str()
+                                  : Triple::normalize(TargetTriple);
+      // If the triple string is still empty, we don't fall back to
+      // sys::getDefaultTargetTriple() since we do not want to have differing
+      // behaviour dependent on the configured default triple. Therefore, if the
+      // user did not pass -mtriple or define an explicit triple/datalayout in
+      // the IR, we should default to an empty (default) DataLayout.
+      if (TripleStr.empty())
+        return std::nullopt;
+
+      Triple TT(TripleStr);
+
+      std::string Str = TT.computeDataLayout(ABIName);
+      if (Str.empty()) {
+        errs() << Argv[0]
+               << ": warning: failed to infer data layout from target triple\n";
+        return std::nullopt;
+      }
+      return Str;
+    };
+    std::unique_ptr<Module> M;
+    if (StdinOverride && InputFilename == "-") {
+      assert(!NoUpgradeDebugInfo &&
+             "TODO(BStott) support NoUpgradeDebugInfo with daemon mode");
+
+      M = parseIR(*StdinOverride, Err, Context, ParserCallbacks(SetDataLayout),
+                  nullptr);
+    } else if (NoUpgradeDebugInfo) {
+      M = parseAssemblyFileWithIndexNoUpgradeDebugInfo(
+              InputFilename, Err, Context, nullptr, SetDataLayout)
+              .Mod;
+    } else {
+      M = parseIRFile(InputFilename, Err, Context,
+                      ParserCallbacks(SetDataLayout));
+    }
+
+    if (!M) {
+      Err.print(Argv[0], errs());
+      return 1;
+    }
+
+    // Strip debug info before running the verifier.
+    if (StripDebug)
+      StripDebugInfo(*M);
+
+    // Erase module-level named metadata, if requested.
+    if (StripNamedMetadata) {
+      while (!M->named_metadata_empty()) {
+        NamedMDNode *NMD = &*M->named_metadata_begin();
+        M->eraseNamedMetadata(NMD);
+      }
+    }
+
+    // If we are supposed to override the target triple, do so now.
+    if (!TargetTriple.empty())
+      M->setTargetTriple(Triple(Triple::normalize(TargetTriple)));
+
+    // Immediately run the verifier to catch any problems before starting up the
+    // pass pipelines.  Otherwise we can crash on broken code during
+    // doInitialization().
+    if (!NoVerify && verifyModule(*M, &errs())) {
+      errs() << Argv[0] << ": " << InputFilename
+             << ": error: input module is broken!\n";
+      return 1;
+    }
+
+    // Enable testing of whole program devirtualization on this module by
+    // invoking the facility for updating public visibility to linkage unit
+    // visibility when specified by an internal option. This is normally done
+    // during LTO which is not performed via opt.
+    updateVCallVisibilityInModule(
+        *M,
+        /*WholeProgramVisibilityEnabledInLTO=*/false,
+        // FIXME: These need linker information via a
+        // TBD new interface.
+        /*DynamicExportSymbols=*/{},
+        /*ValidateAllVtablesHaveTypeInfos=*/false,
+        /*IsVisibleToRegularObj=*/[](StringRef) { return true; });
+
+    // Figure out what stream we are supposed to write to...
+    std::unique_ptr<ToolOutputFile> Out;
+    std::unique_ptr<ToolOutputFile> ThinLinkOut;
+    if (NoOutput) {
+      if (!OutputFilename.empty())
+        errs() << "WARNING: The -o (output filename) option is ignored when\n"
+                  "the --disable-output option is used.\n";
+    } else {
+      // Default to standard output.
+      if (OutputFilename.empty())
+        OutputFilename = "-";
+
+      std::error_code EC;
+      sys::fs::OpenFlags Flags =
+          OutputAssembly ? sys::fs::OF_TextWithCRLF : sys::fs::OF_None;
+      Out.reset(new ToolOutputFile(OutputFilename, EC, Flags));
       if (EC) {
         errs() << EC.message() << '\n';
         return 1;
       }
-    }
-  }
 
-  Triple ModuleTriple(M->getTargetTriple());
-  std::string CPUStr, FeaturesStr;
-  std::unique_ptr<TargetMachine> TM;
-  if (ModuleTriple.getArch()) {
-    CPUStr = codegen::getCPUStr();
-    FeaturesStr = codegen::getFeaturesStr();
-    Expected<std::unique_ptr<TargetMachine>> ExpectedTM =
-        codegen::createTargetMachineForTriple(ModuleTriple.str(),
-                                              GetCodeGenOptLevel());
-    if (auto E = ExpectedTM.takeError()) {
-      errs() << argv[0] << ": WARNING: failed to create target machine for '"
-             << ModuleTriple.str() << "': " << toString(std::move(E)) << "\n";
+      if (!ThinLinkBitcodeFile.empty()) {
+        ThinLinkOut.reset(
+            new ToolOutputFile(ThinLinkBitcodeFile, EC, sys::fs::OF_None));
+        if (EC) {
+          errs() << EC.message() << '\n';
+          return 1;
+        }
+      }
+    }
+
+    Triple ModuleTriple(M->getTargetTriple());
+    std::string CPUStr, FeaturesStr;
+    std::unique_ptr<TargetMachine> TM;
+    if (ModuleTriple.getArch()) {
+      CPUStr = codegen::getCPUStr();
+      FeaturesStr = codegen::getFeaturesStr();
+      Expected<std::unique_ptr<TargetMachine>> ExpectedTM =
+          codegen::createTargetMachineForTriple(ModuleTriple.str(),
+                                                GetCodeGenOptLevel());
+      if (auto E = ExpectedTM.takeError()) {
+        errs() << Argv[0] << ": WARNING: failed to create target machine for '"
+               << ModuleTriple.str() << "': " << toString(std::move(E)) << "\n";
+      } else {
+        TM = std::move(*ExpectedTM);
+      }
+    } else if (ModuleTriple.getArchName() != "unknown" &&
+               ModuleTriple.getArchName() != "") {
+      errs() << Argv[0] << ": unrecognized architecture '"
+             << ModuleTriple.getArchName() << "' provided.\n";
+      return 1;
+    }
+
+    TargetOptions CodeGenFlagsOptions;
+    const TargetOptions *Options = TM ? &TM->Options : &CodeGenFlagsOptions;
+    if (!TM) {
+      CodeGenFlagsOptions =
+          codegen::InitTargetOptionsFromCodeGenFlags(ModuleTriple);
+    }
+
+    // Override function attributes based on CPUStr, FeaturesStr, and command
+    // line flags.
+    codegen::setFunctionAttributes(CPUStr, FeaturesStr, *M);
+
+    // If the output is set to be emitted to standard out, and standard out is a
+    // console, print out a warning message and refuse to do it.  We don't
+    // impress anyone by spewing tons of binary goo to a terminal.
+    if (!Force && !NoOutput && !OutputAssembly)
+      if (CheckBitcodeOutputToConsole(Out->os()))
+        NoOutput = true;
+
+    if (OutputThinLTOBC) {
+      M->addModuleFlag(Module::Error, "EnableSplitLTOUnit", SplitLTOUnit);
+      if (UnifiedLTO)
+        M->addModuleFlag(Module::Error, "UnifiedLTO", 1);
+    }
+
+    // Add an appropriate TargetLibraryInfo pass for the module's triple.
+    TargetLibraryInfoImpl TLII(ModuleTriple, Options->VecLib);
+
+    // The -disable-simplify-libcalls flag actually disables all builtin optzns.
+    if (DisableSimplifyLibCalls)
+      TLII.disableAllFunctions();
+    else {
+      // Disable individual builtin functions in TargetLibraryInfo.
+      LibFunc F;
+      for (const std::string &FuncName : DisableBuiltins) {
+        if (TLII.getLibFunc(FuncName, F))
+          TLII.setUnavailable(F);
+        else {
+          errs() << Argv[0] << ": cannot disable nonexistent builtin function "
+                 << FuncName << '\n';
+          return 1;
+        }
+      }
+
+      for (const std::string &FuncName : EnableBuiltins) {
+        if (TLII.getLibFunc(FuncName, F))
+          TLII.setAvailable(F);
+        else {
+          errs() << Argv[0] << ": cannot enable nonexistent builtin function "
+                 << FuncName << '\n';
+          return 1;
+        }
+      }
+    }
+
+    if (UseNPM) {
+      if (legacy::debugPassSpecified()) {
+        errs() << "-debug-pass does not work with the new PM, either use "
+                  "-debug-pass-manager, or use the legacy PM\n";
+        return 1;
+      }
+      auto NumOLevel = OptLevelO0 + OptLevelO1 + OptLevelO2 + OptLevelO3 +
+                       OptLevelOs + OptLevelOz;
+      if (NumOLevel > 1) {
+        errs() << "Cannot specify multiple -O#\n";
+        return 1;
+      }
+      if (NumOLevel > 0 && (PassPipeline.getNumOccurrences() > 0)) {
+        errs() << "Cannot specify -O# and --passes=/--foo-pass, use "
+                  "-passes='default<O#>,other-pass'\n";
+        return 1;
+      }
+      std::string Pipeline = PassPipeline;
+
+      if (OptLevelO0)
+        Pipeline = "default<O0>";
+      if (OptLevelO1)
+        Pipeline = "default<O1>";
+      if (OptLevelO2)
+        Pipeline = "default<O2>";
+      if (OptLevelO3)
+        Pipeline = "default<O3>";
+      if (OptLevelOs)
+        Pipeline = "default<Os>";
+      if (OptLevelOz)
+        Pipeline = "default<Oz>";
+      OutputKind OK = OK_NoOutput;
+      if (!NoOutput)
+        OK = OutputAssembly ? OK_OutputAssembly
+                            : (OutputThinLTOBC ? OK_OutputThinLTOBitcode
+                                               : OK_OutputBitcode);
+
+      VerifierKind VK = VerifierKind::InputOutput;
+      if (NoVerify)
+        VK = VerifierKind::None;
+      else if (VerifyEach)
+        VK = VerifierKind::EachPass;
+
+      // The user has asked to use the new pass manager and provided a pipeline
+      // string. Hand off the rest of the functionality to the new code for that
+      // layer.
+      if (!runPassPipeline(
+              Argv[0], *M, TM.get(), &TLII, Out.get(), ThinLinkOut.get(),
+              RemarksFile.get(), Pipeline, PluginList, PassBuilderCallbacks, OK,
+              VK, /* ShouldPreserveAssemblyUseListOrder */ false,
+              /* ShouldPreserveBitcodeUseListOrder */ true, EmitSummaryIndex,
+              EmitModuleHash, EnableDebugify, VerifyDebugInfoPreserve,
+              EnableProfileVerification, UnifiedLTO))
+        return 1;
+      return codegen::MaybeSaveStatistics(OutputFilename, "opt");
+    }
+
+    if (OptLevelO0 || OptLevelO1 || OptLevelO2 || OptLevelOs || OptLevelOz ||
+        OptLevelO3) {
+      errs() << "Cannot use -O# with legacy PM.\n";
+      return 1;
+    }
+    if (EmitSummaryIndex) {
+      errs() << "Cannot use -module-summary with legacy PM.\n";
+      return 1;
+    }
+    if (EmitModuleHash) {
+      errs() << "Cannot use -module-hash with legacy PM.\n";
+      return 1;
+    }
+    if (OutputThinLTOBC) {
+      errs() << "Cannot use -thinlto-bc with legacy PM.\n";
+      return 1;
+    }
+    // Create a PassManager to hold and optimize the collection of passes we are
+    // about to build. If the -debugify-each option is set, wrap each pass with
+    // the (-check)-debugify passes.
+    DebugifyCustomPassManager Passes;
+    DebugifyStatsMap DIStatsMap;
+    DebugInfoPerPass DebugInfoBeforePass;
+    if (DebugifyEach) {
+      Passes.setDebugifyMode(DebugifyMode::SyntheticDebugInfo);
+      Passes.setDIStatsMap(DIStatsMap);
+    } else if (VerifyEachDebugInfoPreserve) {
+      Passes.setDebugifyMode(DebugifyMode::OriginalDebugInfo);
+      Passes.setDebugInfoBeforePass(DebugInfoBeforePass);
+      if (!VerifyDIPreserveExport.empty())
+        Passes.setOrigDIVerifyBugsReportFilePath(VerifyDIPreserveExport);
+    }
+
+    bool AddOneTimeDebugifyPasses =
+        (EnableDebugify && !DebugifyEach) ||
+        (VerifyDebugInfoPreserve && !VerifyEachDebugInfoPreserve);
+
+    Passes.add(new TargetLibraryInfoWrapperPass(TLII));
+    Passes.add(new RuntimeLibraryInfoWrapper(
+        ModuleTriple, Options->ExceptionModel, Options->FloatABIType,
+        Options->EABIVersion, Options->MCOptions.ABIName, Options->VecLib));
+
+    // Add internal analysis passes from the target machine.
+    Passes.add(createTargetTransformInfoWrapperPass(
+        TM ? TM->getTargetIRAnalysis() : TargetIRAnalysis()));
+
+    if (AddOneTimeDebugifyPasses) {
+      if (EnableDebugify) {
+        Passes.setDIStatsMap(DIStatsMap);
+        Passes.add(createDebugifyModulePass());
+      } else if (VerifyDebugInfoPreserve) {
+        Passes.setDebugInfoBeforePass(DebugInfoBeforePass);
+        Passes.add(createDebugifyModulePass(DebugifyMode::OriginalDebugInfo, "",
+                                            &(Passes.getDebugInfoPerPass())));
+      }
+    }
+
+    if (TM) {
+      Pass *TPC = TM->createPassConfig(Passes);
+      if (!TPC) {
+        errs() << "Target Machine pass config creation failed.\n";
+        return 1;
+      }
+      Passes.add(TPC);
+    }
+
+    // Create a new optimization pass for each one specified on the command
+    // line.
+    for (const PassInfo *PassInf : PassList) {
+      if (PassInf->getNormalCtor()) {
+        Pass *P = PassInf->getNormalCtor()();
+        if (P) {
+          // Add the pass to the pass manager.
+          Passes.add(P);
+          // If we are verifying all of the intermediate steps, add the
+          // verifier.
+          if (VerifyEach)
+            Passes.add(createVerifierPass());
+        }
+      } else {
+        errs() << Argv[0] << ": cannot create pass: " << PassInf->getPassName()
+               << "\n";
+      }
+    }
+
+    // Check that the module is well formed on completion of optimization
+    if (!NoVerify && !VerifyEach)
+      Passes.add(createVerifierPass());
+
+    if (AddOneTimeDebugifyPasses) {
+      if (EnableDebugify)
+        Passes.add(createCheckDebugifyModulePass(false));
+      else if (VerifyDebugInfoPreserve) {
+        if (!VerifyDIPreserveExport.empty())
+          Passes.setOrigDIVerifyBugsReportFilePath(VerifyDIPreserveExport);
+        Passes.add(createCheckDebugifyModulePass(
+            false, "", nullptr, DebugifyMode::OriginalDebugInfo,
+            &(Passes.getDebugInfoPerPass()), VerifyDIPreserveExport));
+      }
+    }
+
+    // In run twice mode, we want to make sure the output is bit-by-bit
+    // equivalent if we run the pass manager again, so setup two buffers and
+    // a stream to write to them. Note that llc does something similar and it
+    // may be worth to abstract this out in the future.
+    SmallVector<char, 0> Buffer;
+    SmallVector<char, 0> FirstRunBuffer;
+    std::unique_ptr<raw_svector_ostream> BOS;
+    raw_ostream *OS = nullptr;
+
+    const bool ShouldEmitOutput = !NoOutput;
+
+    // Write bitcode or assembly to the output as the last step...
+    if (ShouldEmitOutput || RunTwice) {
+      assert(Out);
+      OS = &Out->os();
+      if (RunTwice) {
+        BOS = std::make_unique<raw_svector_ostream>(Buffer);
+        OS = BOS.get();
+      }
+      if (OutputAssembly)
+        Passes.add(createPrintModulePass(
+            *OS, "", /* ShouldPreserveAssemblyUseListOrder */ false));
+      else
+        Passes.add(createBitcodeWriterPass(
+            *OS, /* ShouldPreserveBitcodeUseListOrder */ true));
+    }
+
+    // Before executing passes, print the final values of the LLVM options.
+    cl::PrintOptionValues();
+
+    if (!RunTwice) {
+      // Now that we have all of the passes ready, run them.
+      Passes.run(*M);
     } else {
-      TM = std::move(*ExpectedTM);
-    }
-  } else if (ModuleTriple.getArchName() != "unknown" &&
-             ModuleTriple.getArchName() != "") {
-    errs() << argv[0] << ": unrecognized architecture '"
-           << ModuleTriple.getArchName() << "' provided.\n";
-    return 1;
-  }
+      // If requested, run all passes twice with the same pass manager to catch
+      // bugs caused by persistent state in the passes.
+      std::unique_ptr<Module> M2(CloneModule(*M));
+      // Run all passes on the original module first, so the second run
+      // processes the clone to catch CloneModule bugs.
+      Passes.run(*M);
+      FirstRunBuffer = Buffer;
+      Buffer.clear();
 
-  TargetOptions CodeGenFlagsOptions;
-  const TargetOptions *Options = TM ? &TM->Options : &CodeGenFlagsOptions;
-  if (!TM) {
-    CodeGenFlagsOptions =
-        codegen::InitTargetOptionsFromCodeGenFlags(ModuleTriple);
-  }
+      Passes.run(*M2);
 
-  // Override function attributes based on CPUStr, FeaturesStr, and command line
-  // flags.
-  codegen::setFunctionAttributes(CPUStr, FeaturesStr, *M);
-
-  // If the output is set to be emitted to standard out, and standard out is a
-  // console, print out a warning message and refuse to do it.  We don't
-  // impress anyone by spewing tons of binary goo to a terminal.
-  if (!Force && !NoOutput && !OutputAssembly)
-    if (CheckBitcodeOutputToConsole(Out->os()))
-      NoOutput = true;
-
-  if (OutputThinLTOBC) {
-    M->addModuleFlag(Module::Error, "EnableSplitLTOUnit", SplitLTOUnit);
-    if (UnifiedLTO)
-      M->addModuleFlag(Module::Error, "UnifiedLTO", 1);
-  }
-
-  // Add an appropriate TargetLibraryInfo pass for the module's triple.
-  TargetLibraryInfoImpl TLII(ModuleTriple, Options->VecLib);
-
-  // The -disable-simplify-libcalls flag actually disables all builtin optzns.
-  if (DisableSimplifyLibCalls)
-    TLII.disableAllFunctions();
-  else {
-    // Disable individual builtin functions in TargetLibraryInfo.
-    LibFunc F;
-    for (const std::string &FuncName : DisableBuiltins) {
-      if (TLII.getLibFunc(FuncName, F))
-        TLII.setUnavailable(F);
-      else {
-        errs() << argv[0] << ": cannot disable nonexistent builtin function "
-               << FuncName << '\n';
+      // Compare the two outputs and make sure they're the same
+      assert(Out);
+      if (Buffer.size() != FirstRunBuffer.size() ||
+          (memcmp(Buffer.data(), FirstRunBuffer.data(), Buffer.size()) != 0)) {
+        errs()
+            << "Running the pass manager twice changed the output.\n"
+               "Writing the result of the second run to the specified output.\n"
+               "To generate the one-run comparison binary, just run without\n"
+               "the compile-twice option\n";
+        if (ShouldEmitOutput) {
+          Out->os() << BOS->str();
+          Out->keep();
+        }
+        if (RemarksFile)
+          RemarksFile->keep();
         return 1;
       }
+      if (ShouldEmitOutput)
+        Out->os() << BOS->str();
     }
 
-    for (const std::string &FuncName : EnableBuiltins) {
-      if (TLII.getLibFunc(FuncName, F))
-        TLII.setAvailable(F);
-      else {
-        errs() << argv[0] << ": cannot enable nonexistent builtin function "
-               << FuncName << '\n';
-        return 1;
-      }
-    }
-  }
+    if (DebugifyEach && !DebugifyExport.empty())
+      exportDebugifyStats(DebugifyExport, Passes.getDebugifyStatsMap());
 
-  if (UseNPM) {
-    if (legacy::debugPassSpecified()) {
-      errs() << "-debug-pass does not work with the new PM, either use "
-                "-debug-pass-manager, or use the legacy PM\n";
-      return 1;
-    }
-    auto NumOLevel = OptLevelO0 + OptLevelO1 + OptLevelO2 + OptLevelO3 +
-                     OptLevelOs + OptLevelOz;
-    if (NumOLevel > 1) {
-      errs() << "Cannot specify multiple -O#\n";
-      return 1;
-    }
-    if (NumOLevel > 0 && (PassPipeline.getNumOccurrences() > 0)) {
-      errs() << "Cannot specify -O# and --passes=/--foo-pass, use "
-                "-passes='default<O#>,other-pass'\n";
-      return 1;
-    }
-    std::string Pipeline = PassPipeline;
-
-    if (OptLevelO0)
-      Pipeline = "default<O0>";
-    if (OptLevelO1)
-      Pipeline = "default<O1>";
-    if (OptLevelO2)
-      Pipeline = "default<O2>";
-    if (OptLevelO3)
-      Pipeline = "default<O3>";
-    if (OptLevelOs)
-      Pipeline = "default<Os>";
-    if (OptLevelOz)
-      Pipeline = "default<Oz>";
-    OutputKind OK = OK_NoOutput;
+    // Declare success.
     if (!NoOutput)
-      OK = OutputAssembly
-               ? OK_OutputAssembly
-               : (OutputThinLTOBC ? OK_OutputThinLTOBitcode : OK_OutputBitcode);
+      Out->keep();
 
-    VerifierKind VK = VerifierKind::InputOutput;
-    if (NoVerify)
-      VK = VerifierKind::None;
-    else if (VerifyEach)
-      VK = VerifierKind::EachPass;
+    if (RemarksFile)
+      RemarksFile->keep();
 
-    // The user has asked to use the new pass manager and provided a pipeline
-    // string. Hand off the rest of the functionality to the new code for that
-    // layer.
-    if (!runPassPipeline(
-            argv[0], *M, TM.get(), &TLII, Out.get(), ThinLinkOut.get(),
-            RemarksFile.get(), Pipeline, PluginList, PassBuilderCallbacks, OK,
-            VK, /* ShouldPreserveAssemblyUseListOrder */ false,
-            /* ShouldPreserveBitcodeUseListOrder */ true, EmitSummaryIndex,
-            EmitModuleHash, EnableDebugify, VerifyDebugInfoPreserve,
-            EnableProfileVerification, UnifiedLTO))
-      return 1;
+    if (ThinLinkOut)
+      ThinLinkOut->keep();
+
     return codegen::MaybeSaveStatistics(OutputFilename, "opt");
   }
 
-  if (OptLevelO0 || OptLevelO1 || OptLevelO2 || OptLevelOs || OptLevelOz ||
-      OptLevelO3) {
-    errs() << "Cannot use -O# with legacy PM.\n";
-    return 1;
-  }
-  if (EmitSummaryIndex) {
-    errs() << "Cannot use -module-summary with legacy PM.\n";
-    return 1;
-  }
-  if (EmitModuleHash) {
-    errs() << "Cannot use -module-hash with legacy PM.\n";
-    return 1;
-  }
-  if (OutputThinLTOBC) {
-    errs() << "Cannot use -thinlto-bc with legacy PM.\n";
-    return 1;
-  }
-  // Create a PassManager to hold and optimize the collection of passes we are
-  // about to build. If the -debugify-each option is set, wrap each pass with
-  // the (-check)-debugify passes.
-  DebugifyCustomPassManager Passes;
-  DebugifyStatsMap DIStatsMap;
-  DebugInfoPerPass DebugInfoBeforePass;
-  if (DebugifyEach) {
-    Passes.setDebugifyMode(DebugifyMode::SyntheticDebugInfo);
-    Passes.setDIStatsMap(DIStatsMap);
-  } else if (VerifyEachDebugInfoPreserve) {
-    Passes.setDebugifyMode(DebugifyMode::OriginalDebugInfo);
-    Passes.setDebugInfoBeforePass(DebugInfoBeforePass);
-    if (!VerifyDIPreserveExport.empty())
-      Passes.setOrigDIVerifyBugsReportFilePath(VerifyDIPreserveExport);
-  }
-
-  bool AddOneTimeDebugifyPasses =
-      (EnableDebugify && !DebugifyEach) ||
-      (VerifyDebugInfoPreserve && !VerifyEachDebugInfoPreserve);
-
-  Passes.add(new TargetLibraryInfoWrapperPass(TLII));
-  Passes.add(new RuntimeLibraryInfoWrapper(
-      ModuleTriple, Options->ExceptionModel, Options->FloatABIType,
-      Options->EABIVersion, Options->MCOptions.ABIName, Options->VecLib));
-
-  // Add internal analysis passes from the target machine.
-  Passes.add(createTargetTransformInfoWrapperPass(TM ? TM->getTargetIRAnalysis()
-                                                     : TargetIRAnalysis()));
-
-  if (AddOneTimeDebugifyPasses) {
-    if (EnableDebugify) {
-      Passes.setDIStatsMap(DIStatsMap);
-      Passes.add(createDebugifyModulePass());
-    } else if (VerifyDebugInfoPreserve) {
-      Passes.setDebugInfoBeforePass(DebugInfoBeforePass);
-      Passes.add(createDebugifyModulePass(DebugifyMode::OriginalDebugInfo, "",
-                                          &(Passes.getDebugInfoPerPass())));
+  virtual void resetState() override {
+    cl::ResetAllOptionOccurrences();
+    if (AreStatisticsEnabled()) {
+      PrintStatistics();
+      ResetStatistics();
     }
   }
 
-  if (TM) {
-    Pass *TPC = TM->createPassConfig(Passes);
-    if (!TPC) {
-      errs() << "Target Machine pass config creation failed.\n";
-      return 1;
-    }
-    Passes.add(TPC);
-  }
-
-  // Create a new optimization pass for each one specified on the command line.
-  for (const PassInfo *PassInf : PassList) {
-    if (PassInf->getNormalCtor()) {
-      Pass *P = PassInf->getNormalCtor()();
-      if (P) {
-        // Add the pass to the pass manager.
-        Passes.add(P);
-        // If we are verifying all of the intermediate steps, add the verifier.
-        if (VerifyEach)
-          Passes.add(createVerifierPass());
-      }
-    } else {
-      errs() << argv[0] << ": cannot create pass: " << PassInf->getPassName()
-             << "\n";
-    }
-  }
-
-  // Check that the module is well formed on completion of optimization
-  if (!NoVerify && !VerifyEach)
-    Passes.add(createVerifierPass());
-
-  if (AddOneTimeDebugifyPasses) {
-    if (EnableDebugify)
-      Passes.add(createCheckDebugifyModulePass(false));
-    else if (VerifyDebugInfoPreserve) {
-      if (!VerifyDIPreserveExport.empty())
-        Passes.setOrigDIVerifyBugsReportFilePath(VerifyDIPreserveExport);
-      Passes.add(createCheckDebugifyModulePass(
-          false, "", nullptr, DebugifyMode::OriginalDebugInfo,
-          &(Passes.getDebugInfoPerPass()), VerifyDIPreserveExport));
-    }
-  }
-
-  // In run twice mode, we want to make sure the output is bit-by-bit
-  // equivalent if we run the pass manager again, so setup two buffers and
-  // a stream to write to them. Note that llc does something similar and it
-  // may be worth to abstract this out in the future.
-  SmallVector<char, 0> Buffer;
-  SmallVector<char, 0> FirstRunBuffer;
-  std::unique_ptr<raw_svector_ostream> BOS;
-  raw_ostream *OS = nullptr;
-
-  const bool ShouldEmitOutput = !NoOutput;
-
-  // Write bitcode or assembly to the output as the last step...
-  if (ShouldEmitOutput || RunTwice) {
-    assert(Out);
-    OS = &Out->os();
-    if (RunTwice) {
-      BOS = std::make_unique<raw_svector_ostream>(Buffer);
-      OS = BOS.get();
-    }
-    if (OutputAssembly)
-      Passes.add(createPrintModulePass(
-          *OS, "", /* ShouldPreserveAssemblyUseListOrder */ false));
-    else
-      Passes.add(createBitcodeWriterPass(
-          *OS, /* ShouldPreserveBitcodeUseListOrder */ true));
-  }
-
-  // Before executing passes, print the final values of the LLVM options.
-  cl::PrintOptionValues();
-
-  if (!RunTwice) {
-    // Now that we have all of the passes ready, run them.
-    Passes.run(*M);
-  } else {
-    // If requested, run all passes twice with the same pass manager to catch
-    // bugs caused by persistent state in the passes.
-    std::unique_ptr<Module> M2(CloneModule(*M));
-    // Run all passes on the original module first, so the second run processes
-    // the clone to catch CloneModule bugs.
-    Passes.run(*M);
-    FirstRunBuffer = Buffer;
-    Buffer.clear();
-
-    Passes.run(*M2);
-
-    // Compare the two outputs and make sure they're the same
-    assert(Out);
-    if (Buffer.size() != FirstRunBuffer.size() ||
-        (memcmp(Buffer.data(), FirstRunBuffer.data(), Buffer.size()) != 0)) {
-      errs()
-          << "Running the pass manager twice changed the output.\n"
-             "Writing the result of the second run to the specified output.\n"
-             "To generate the one-run comparison binary, just run without\n"
-             "the compile-twice option\n";
-      if (ShouldEmitOutput) {
-        Out->os() << BOS->str();
-        Out->keep();
-      }
-      if (RemarksFile)
-        RemarksFile->keep();
-      return 1;
-    }
-    if (ShouldEmitOutput)
-      Out->os() << BOS->str();
-  }
-
-  if (DebugifyEach && !DebugifyExport.empty())
-    exportDebugifyStats(DebugifyExport, Passes.getDebugifyStatsMap());
-
-  // Declare success.
-  if (!NoOutput)
-    Out->keep();
-
-  if (RemarksFile)
-    RemarksFile->keep();
-
-  if (ThinLinkOut)
-    ThinLinkOut->keep();
-
-  return codegen::MaybeSaveStatistics(OutputFilename, "opt");
-}
+  ArrayRef<std::function<void(PassBuilder &)>> PassBuilderCallbacks;
+};
 
 extern "C" int
 optMain(int argc, char **argv,
@@ -952,35 +971,12 @@ optMain(int argc, char **argv,
   initializeReplaceWithVeclibLegacyPass(Registry);
   initializeJMCInstrumenterPass(Registry);
 
-  initializeDaemonOptions();
-
   // Register the Target and CPU printer for --version.
   cl::AddExtraVersionPrinter(sys::printDefaultTargetAndDetectedCPU);
 
-  cl::ParseCommandLineOptions(argc, argv, CommandOverview);
+  cl::ParseCommandLineOptions(
+      argc, argv, "llvm .bc -> .bc modular optimizer and analysis printer\n");
 
-  // To ensure bugs with command line resetting do not affect standard `opt`, we
-  // avoid using `ParseCommandLineOptions` to detect `--daemon-mode`.
-  if (daemonModeEnabled()) {
-    return runDaemonMode(
-        [&](int InvocationArgc, char **InvocationArgv, MemoryBufferRef Input) {
-          cl::ResetAllOptionOccurrences();
-          cl::ParseCommandLineOptions(InvocationArgc, InvocationArgv,
-                                      CommandOverview);
-
-          int ExitCode = runOpt(InvocationArgc, InvocationArgv,
-                                   PassBuilderCallbacks, Input);
-
-          // Reset state for next invocation.
-          if (AreStatisticsEnabled()) {
-            PrintStatistics();
-            ResetStatistics();
-          }
-          // TODO reset debug counters
-
-          return ExitCode;
-        });
-  }
-
-  return runOpt(argc, argv, PassBuilderCallbacks, std::nullopt);
+  OptTool Tool(PassBuilderCallbacks);
+  return runWithDaemonSupport(Tool, argc, argv);
 }

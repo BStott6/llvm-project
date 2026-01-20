@@ -1,16 +1,28 @@
+//===- llvm/Support/DaemonDriver.cpp - Daemon driver interface --*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file implements the interface for tools to be run in "daemon mode",
+// following the IPC protocol as described in docs/DaemonMode.rst.
+//
+//===----------------------------------------------------------------------===//
+
 #include "llvm/Support/DaemonDriver.h"
+
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/ScopedFileRedirect.h"
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
 
 #if defined _WIN32
 #include <io.h>
-#else
-#include <unistd.h>
 #endif
 
 // Standard stream fileno macros are not defined on Windows.
@@ -24,37 +36,38 @@
 #define STDERR_FILENO 2
 #endif
 
-// Windows emulated POSIX functions are prefixed by `_`.
-#ifdef _WIN32
-#define CLOSE_FN _close
-#define DUP_FN _dup
-#define DUP2_FN _dup2
-#else
-#define CLOSE_FN close
-#define DUP_FN dup
-#define DUP2_FN dup2
-#endif
-
 using namespace llvm;
 
+namespace {
+/// Status code returned if the daemon fails to initialize, for example due to
+/// incorrect command line arguments.
 constexpr int StatusInitError = 2;
+/// Status code returned if the daemon receives a malformed command.
 constexpr int StatusCommandError = 3;
 
-static bool DaemonOptionsInitialized = false;
 static bool DaemonMode;
 static int DaemonStatusFd;
 static int DaemonStatusHandle;
 
-LLVM_ABI void llvm::initializeDaemonOptions() {
-  DaemonOptionsInitialized = true;
+/// This should only be used before the status pipe is set up - after,
+/// errors are reported to the user via the status pipe.
+[[noreturn]] void reportInitError(const Twine &Err) {
+  llvm::errs() << "[daemon] error: " << Err << "\n";
+  std::exit(StatusInitError);
+}
 
+bool detectDaemonArg(int Argc, char **Argv) {
+  // `--daemon` must be the first argument.
+  return Argc >= 2 && StringRef("--daemon") == Argv[1];
+}
+
+void initializeDaemonOptions() {
   static cl::OptionCategory DaemonCategory(
       "Daemon Options", "Options for running tools in daemon mode");
 
   static cl::opt<bool, true> DaemonModeOpt(
-      "daemon", cl::desc("Run this tool in daemon mode"),
-      cl::cat(DaemonCategory), cl::ReallyHidden, cl::location(DaemonMode),
-      cl::init(false));
+      "daemon", cl::cat(DaemonCategory), cl::ReallyHidden,
+      cl::location(DaemonMode), cl::init(false));
 
   static cl::opt<int, true> DaemonStatusFdOpt(
       "daemon-status-fd",
@@ -71,16 +84,7 @@ LLVM_ABI void llvm::initializeDaemonOptions() {
       cl::location(DaemonStatusHandle), cl::init(-1));
 }
 
-LLVM_ABI bool llvm::daemonModeEnabled() {
-  assert(DaemonOptionsInitialized &&
-         "`initializeDaemonOptions` must be called before `daemonModeEnabled`");
-  return DaemonMode;
-}
-
 /// Utility to read an input stream line-by-line.
-/// Can't use `std::cin` because the <iostream> header is forbidden, and can't
-/// use `std::ifstream` because there isn't a way to construct one from a file
-/// descriptor.
 class LineReader {
 public:
   explicit LineReader(FILE *const File) : File(File) {}
@@ -108,18 +112,10 @@ private:
   FILE *File;
 };
 
-/// This should only be used before the status pipe is set up - after,
-/// errors are reported to the user via the status pipe.
-[[noreturn]] static void reportInitError(const Twine &Err) {
-  llvm::errs() << "[daemon] error: " << Err << "\n";
-  std::exit(StatusInitError);
-}
-
 class DaemonDriver {
 public:
-  DaemonDriver(const ToolInvokeFn InvokeTool, const int StatusPipeFd)
-      : InvokeTool(InvokeTool),
-        StatusPipeWriter(createStatusPipeWriter(StatusPipeFd)) {};
+  DaemonDriver(LLVMTool &Tool, const int StatusPipeFd)
+      : Tool(Tool), StatusPipeWriter(createStatusPipeWriter(StatusPipeFd)) {};
 
   int run() {
     LineReader StdinReader(stdin);
@@ -161,7 +157,7 @@ public:
           reportCommandError("Unexpected trailing characters in command: " +
                              Command);
         }
-        redirectStderrToStdout();
+        RedirectStderrToStdout = true;
       } else {
         reportCommandError("Unexpected command: " + Command);
       }
@@ -217,19 +213,25 @@ private:
       ArgsCStr.push_back(Arg.data());
     }
 
-    // Invoke the tool itself.
-    const int ExitCode = InvokeTool(ArgsCStr.size(), ArgsCStr.data(),
+    // Invoke the tool.
+    int ExitCode;
+    {
+      std::optional<ScopedFileRedirect> StderrRedirect; 
+      if (RedirectStderrToStdout)
+        StderrRedirect.emplace(STDERR_FILENO, STDOUT_FILENO);
+
+      ExitCode = Tool.run(ArgsCStr.size(), ArgsCStr.data(),
                                     MemoryBufferRef(ToolInput, "<stdin>"));
+    }
+
+    // Reset state for the next invocation.
+    Tool.resetState();
+    ToolInput.clear();
+    RedirectStderrToStdout = false;
 
     // Make sure the user gets all the output.
     llvm::outs().flush();
     llvm::errs().flush();
-
-    // Reset state for the next invocation.
-    ToolInput.clear();
-    if (StderrRedirectedToStdout) {
-      resetStderr();
-    }
 
     // Inform the user that the command has finished and provide the exit code.
     messageReturned(ExitCode);
@@ -261,41 +263,6 @@ private:
     }
 
     messageOk();
-  }
-
-  /// Redirect the `stderr` stream to point to the same file descriptor as
-  /// stdout, duplicating the original file descriptor for stderr so that it
-  /// can be reset later.
-  void redirectStderrToStdout() {
-    if (StderrRedirectedToStdout) {
-      reportCommandError("Stderr is already redirected to stdout.");
-      std::exit(1);
-    }
-
-    llvm::errs().flush();
-
-    // Store a copy of the original file so that it can be reset later.
-    StderrCopy = DUP_FN(STDERR_FILENO);
-
-    // Close stderr and open it to stdout.
-    DUP2_FN(STDOUT_FILENO, STDERR_FILENO);
-
-    StderrRedirectedToStdout = true;
-  }
-
-  void resetStderr() {
-    assert(StderrRedirectedToStdout && StderrCopy.has_value());
-
-    llvm::errs().flush();
-
-    // Close stderr and open it to the original stderr.
-    DUP2_FN(*StderrCopy, STDERR_FILENO);
-
-    // The copied stderr file descriptor is no longer needed.
-    CLOSE_FN(*StderrCopy);
-
-    StderrCopy = std::nullopt;
-    StderrRedirectedToStdout = false;
   }
 
   /// Splits a command string into arguments.
@@ -352,47 +319,53 @@ private:
     return Args;
   }
 
-  ToolInvokeFn InvokeTool;
+  LLVMTool &Tool;
   std::string ToolInput;
   raw_fd_ostream StatusPipeWriter;
-  bool StderrRedirectedToStdout = false;
-  std::optional<int> StderrCopy;
+  bool RedirectStderrToStdout = false;
 };
 
-LLVM_ABI int llvm::runDaemonMode(ToolInvokeFn InvokeTool) {
-  // Make sure all IO streams are in binary mode, so that line ending characters
-  // are not modified on Windows.
-  sys::ChangeStdinToBinary();
-  sys::ChangeStdoutToBinary();
-  sys::ChangeStderrToBinary();
-
-  assert(DaemonOptionsInitialized &&
-         "`initializeDaemonOptions` must be called before `runDaemonMode`");
+int runDaemonMode(LLVMTool &Tool, int Argc, char **Argv) {
+  // Parse daemon command line options.
+  initializeDaemonOptions();
+  cl::ParseCommandLineOptions(Argc, Argv);
 
   if (DaemonStatusFd < 0 && DaemonStatusHandle < 0) {
-    reportInitError(
-        "Must provide either `--daemon-status-fd` or `--daemon-status-handle (Windows-only)`");
+    reportInitError("Must provide either `--daemon-status-fd` or "
+                    "`--daemon-status-handle (Windows-only)`");
   }
   if (DaemonStatusFd >= 0 && DaemonStatusHandle >= 0) {
     reportInitError("Cannot provide both `--daemon-status-fd` and "
                     "`--daemon-status-handle`");
   }
 
-#ifndef _WIN32
-  if (DaemonStatusHandle >= 0) {
-    reportInitError(
-        "`--daemon-status-handle` should only be passed on Windows.");
-  }
-  const int StatusPipeFd = DaemonStatusFd;
-#else
+#ifdef _WIN32
   const int StatusPipeFd = [] {
     if (DaemonStatusHandle >= 0) {
       return _open_osfhandle(DaemonStatusHandle, 0);
     }
     return DaemonStatusFd;
   }();
+#else
+  if (DaemonStatusHandle >= 0) {
+    reportInitError(
+        "`--daemon-status-handle` should only be passed on Windows.");
+  }
+  const int StatusPipeFd = DaemonStatusFd;
 #endif
 
-  DaemonDriver Driver(InvokeTool, StatusPipeFd);
+  cl::ResetAllOptionOccurrences();
+
+  DaemonDriver Driver(Tool, StatusPipeFd);
   return Driver.run();
+}
+} // namespace
+
+LLVM_ABI int llvm::runWithDaemonSupport(LLVMTool &Tool, int Argc, char **Argv) {
+  if (detectDaemonArg(Argc, Argv)) {
+    return runDaemonMode(Tool, Argc, Argv);
+  }
+
+  // Otherwise run normally.
+  return Tool.run(Argc, Argv, std::nullopt);
 }

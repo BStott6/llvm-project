@@ -22,6 +22,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/ToolInterface.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cmath>
@@ -729,156 +730,164 @@ static void DumpAnnotatedInput(raw_ostream &OS, const FileCheckRequest &Req,
   OS << ">>>>>>\n";
 }
 
-static int runFileCheck(int argc, char **argv,
-                        std::optional<MemoryBufferRef> DaemonInput) {
-  // Select -dump-input* values.  The -help documentation specifies the default
-  // value and which value to choose if an option is specified multiple times.
-  // In the latter case, the general rule of thumb is to choose the value that
-  // provides the most information.
-  DumpInputValue DumpInput =
-      DumpInputs.empty() ? DumpInputFail : *llvm::max_element(DumpInputs);
-  DumpInputFilterValue DumpInputFilter;
-  if (DumpInputFilters.empty())
-    DumpInputFilter = DumpInput == DumpInputAlways ? DumpInputFilterAll
-                                                   : DumpInputFilterError;
-  else
-    DumpInputFilter = *llvm::max_element(DumpInputFilters);
-  unsigned DumpInputContext =
-      DumpInputContexts.empty() ? 5 : *llvm::max_element(DumpInputContexts);
+class FileCheckTool : public LLVMTool {
+public:
+  virtual int run(int argc, char **argv,
+                  std::optional<MemoryBufferRef> StdinOverride) override {
+    cl::ParseCommandLineOptions(argc, argv, /*Overview*/ "", /*Errs*/ nullptr,
+                                /*VFS*/ nullptr, "FILECHECK_OPTS");
 
-  if (DumpInput == DumpInputHelp) {
-    DumpInputAnnotationHelp(outs());
-    return 0;
-  }
-  if (CheckFilename.empty()) {
-    errs() << "<check-file> not specified\n";
-    return 2;
-  }
+    // Select -dump-input* values.  The -help documentation specifies the
+    // default value and which value to choose if an option is specified
+    // multiple times. In the latter case, the general rule of thumb is to
+    // choose the value that provides the most information.
+    DumpInputValue DumpInput =
+        DumpInputs.empty() ? DumpInputFail : *llvm::max_element(DumpInputs);
+    DumpInputFilterValue DumpInputFilter;
+    if (DumpInputFilters.empty())
+      DumpInputFilter = DumpInput == DumpInputAlways ? DumpInputFilterAll
+                                                     : DumpInputFilterError;
+    else
+      DumpInputFilter = *llvm::max_element(DumpInputFilters);
+    unsigned DumpInputContext =
+        DumpInputContexts.empty() ? 5 : *llvm::max_element(DumpInputContexts);
 
-  FileCheckRequest Req;
-  append_range(Req.CheckPrefixes, CheckPrefixes);
-
-  append_range(Req.CommentPrefixes, CommentPrefixes);
-
-  append_range(Req.ImplicitCheckNot, ImplicitCheckNot);
-
-  bool GlobalDefineError = false;
-  for (StringRef G : GlobalDefines) {
-    size_t EqIdx = G.find('=');
-    if (EqIdx == std::string::npos) {
-      errs() << "Missing equal sign in command-line definition '-D" << G
-             << "'\n";
-      GlobalDefineError = true;
-      continue;
+    if (DumpInput == DumpInputHelp) {
+      DumpInputAnnotationHelp(outs());
+      return 0;
     }
-    if (EqIdx == 0) {
-      errs() << "Missing variable name in command-line definition '-D" << G
-             << "'\n";
-      GlobalDefineError = true;
-      continue;
+    if (CheckFilename.empty()) {
+      errs() << "<check-file> not specified\n";
+      return 2;
     }
-    Req.GlobalDefines.push_back(G);
-  }
-  if (GlobalDefineError)
-    return 2;
 
-  Req.AllowEmptyInput = AllowEmptyInput;
-  Req.AllowUnusedPrefixes = AllowUnusedPrefixes;
-  Req.EnableVarScope = EnableVarScope;
-  Req.AllowDeprecatedDagOverlap = AllowDeprecatedDagOverlap;
-  Req.Verbose = Verbose;
-  Req.VerboseVerbose = VerboseVerbose;
-  Req.NoCanonicalizeWhiteSpace = NoCanonicalizeWhiteSpace;
-  Req.MatchFullLines = MatchFullLines;
-  Req.IgnoreCase = IgnoreCase;
+    FileCheckRequest Req;
+    append_range(Req.CheckPrefixes, CheckPrefixes);
 
-  if (VerboseVerbose)
-    Req.Verbose = true;
+    append_range(Req.CommentPrefixes, CommentPrefixes);
 
-  FileCheck FC(Req);
-  if (!FC.ValidateCheckPrefixes())
-    return 2;
+    append_range(Req.ImplicitCheckNot, ImplicitCheckNot);
 
-  SourceMgr SM;
+    bool GlobalDefineError = false;
+    for (StringRef G : GlobalDefines) {
+      size_t EqIdx = G.find('=');
+      if (EqIdx == std::string::npos) {
+        errs() << "Missing equal sign in command-line definition '-D" << G
+               << "'\n";
+        GlobalDefineError = true;
+        continue;
+      }
+      if (EqIdx == 0) {
+        errs() << "Missing variable name in command-line definition '-D" << G
+               << "'\n";
+        GlobalDefineError = true;
+        continue;
+      }
+      Req.GlobalDefines.push_back(G);
+    }
+    if (GlobalDefineError)
+      return 2;
 
-  // Read the expected strings from the check file.
-  ErrorOr<std::unique_ptr<MemoryBuffer>> CheckFileOrErr =
-      MemoryBuffer::getFileOrSTDIN(CheckFilename, /*IsText=*/true);
-  if (std::error_code EC = CheckFileOrErr.getError()) {
-    errs() << "Could not open check file '" << CheckFilename
-           << "': " << EC.message() << '\n';
-    return 2;
-  }
-  MemoryBuffer &CheckFile = *CheckFileOrErr.get();
+    Req.AllowEmptyInput = AllowEmptyInput;
+    Req.AllowUnusedPrefixes = AllowUnusedPrefixes;
+    Req.EnableVarScope = EnableVarScope;
+    Req.AllowDeprecatedDagOverlap = AllowDeprecatedDagOverlap;
+    Req.Verbose = Verbose;
+    Req.VerboseVerbose = VerboseVerbose;
+    Req.NoCanonicalizeWhiteSpace = NoCanonicalizeWhiteSpace;
+    Req.MatchFullLines = MatchFullLines;
+    Req.IgnoreCase = IgnoreCase;
 
-  SmallString<4096> CheckFileBuffer;
-  StringRef CheckFileText = FC.CanonicalizeFile(CheckFile, CheckFileBuffer);
+    if (VerboseVerbose)
+      Req.Verbose = true;
 
-  unsigned CheckFileBufferID =
-      SM.AddNewSourceBuffer(MemoryBuffer::getMemBuffer(
-                                CheckFileText, CheckFile.getBufferIdentifier()),
-                            SMLoc());
+    FileCheck FC(Req);
+    if (!FC.ValidateCheckPrefixes())
+      return 2;
 
-  std::pair<unsigned, unsigned> ImpPatBufferIDRange;
-  if (FC.readCheckFile(SM, CheckFileText, &ImpPatBufferIDRange))
-    return 2;
+    SourceMgr SM;
 
-  // Open the file to check and add it to SourceMgr.
-  std::unique_ptr<MemoryBuffer> InputFile;
-  if (DaemonInput && InputFilename == "-") {
-    InputFile = WritableMemoryBuffer::getNewUninitMemBuffer(
-        DaemonInput->getBufferSize(), DaemonInput->getBufferIdentifier());
-    std::copy(DaemonInput->getBufferStart(), DaemonInput->getBufferEnd(),
-              const_cast<char *>(InputFile->getBufferStart()));
-  } else {
-    ErrorOr<std::unique_ptr<MemoryBuffer>> InputFileOrErr =
-        MemoryBuffer::getFileOrSTDIN(InputFilename, /*IsText=*/true);
-    if (InputFilename == "-")
-      InputFilename = "<stdin>"; // Overwrite for improved diagnostic messages
-    if (std::error_code EC = InputFileOrErr.getError()) {
-      errs() << "Could not open input file '" << InputFilename
+    // Read the expected strings from the check file.
+    ErrorOr<std::unique_ptr<MemoryBuffer>> CheckFileOrErr =
+        MemoryBuffer::getFileOrSTDIN(CheckFilename, /*IsText=*/true);
+    if (std::error_code EC = CheckFileOrErr.getError()) {
+      errs() << "Could not open check file '" << CheckFilename
              << "': " << EC.message() << '\n';
       return 2;
     }
-    InputFile = std::move(InputFileOrErr.get());
+    MemoryBuffer &CheckFile = *CheckFileOrErr.get();
+
+    SmallString<4096> CheckFileBuffer;
+    StringRef CheckFileText = FC.CanonicalizeFile(CheckFile, CheckFileBuffer);
+
+    unsigned CheckFileBufferID = SM.AddNewSourceBuffer(
+        MemoryBuffer::getMemBuffer(CheckFileText,
+                                   CheckFile.getBufferIdentifier()),
+        SMLoc());
+
+    std::pair<unsigned, unsigned> ImpPatBufferIDRange;
+    if (FC.readCheckFile(SM, CheckFileText, &ImpPatBufferIDRange))
+      return 2;
+
+    // Open the file to check and add it to SourceMgr.
+    std::unique_ptr<MemoryBuffer> InputFile;
+    if (StdinOverride && InputFilename == "-") {
+      InputFile = WritableMemoryBuffer::getNewUninitMemBuffer(
+          StdinOverride->getBufferSize(), StdinOverride->getBufferIdentifier());
+      std::copy(StdinOverride->getBufferStart(), StdinOverride->getBufferEnd(),
+                const_cast<char *>(InputFile->getBufferStart()));
+    } else {
+      ErrorOr<std::unique_ptr<MemoryBuffer>> InputFileOrErr =
+          MemoryBuffer::getFileOrSTDIN(InputFilename, /*IsText=*/true);
+      if (InputFilename == "-")
+        InputFilename = "<stdin>"; // Overwrite for improved diagnostic messages
+      if (std::error_code EC = InputFileOrErr.getError()) {
+        errs() << "Could not open input file '" << InputFilename
+               << "': " << EC.message() << '\n';
+        return 2;
+      }
+      InputFile = std::move(InputFileOrErr.get());
+    }
+
+    if (InputFile->getBufferSize() == 0 && !AllowEmptyInput) {
+      errs() << "FileCheck error: '" << InputFilename << "' is empty.\n";
+      DumpCommandLine(argc, argv);
+      return 2;
+    }
+
+    SmallString<4096> InputFileBuffer;
+    StringRef InputFileText = FC.CanonicalizeFile(*InputFile, InputFileBuffer);
+
+    SM.AddNewSourceBuffer(MemoryBuffer::getMemBuffer(
+                              InputFileText, InputFile->getBufferIdentifier()),
+                          SMLoc());
+
+    std::vector<FileCheckDiag> Diags;
+    int ExitCode = FC.checkInput(SM, InputFileText,
+                                 DumpInput == DumpInputNever ? nullptr : &Diags)
+                       ? EXIT_SUCCESS
+                       : 1;
+    if (DumpInput == DumpInputAlways ||
+        (ExitCode == 1 && DumpInput == DumpInputFail)) {
+      errs() << "\n"
+             << "Input file: " << InputFilename << "\n"
+             << "Check file: " << CheckFilename << "\n"
+             << "\n"
+             << "-dump-input=help explains the following input dump.\n"
+             << "\n";
+      std::vector<InputAnnotation> Annotations;
+      unsigned LabelWidth;
+      BuildInputAnnotations(SM, CheckFileBufferID, ImpPatBufferIDRange, Diags,
+                            Annotations, LabelWidth);
+      DumpAnnotatedInput(errs(), Req, DumpInputFilter, DumpInputContext,
+                         InputFileText, Annotations, LabelWidth);
+    }
+
+    return ExitCode;
   }
 
-  if (InputFile->getBufferSize() == 0 && !AllowEmptyInput) {
-    errs() << "FileCheck error: '" << InputFilename << "' is empty.\n";
-    DumpCommandLine(argc, argv);
-    return 2;
-  }
-
-  SmallString<4096> InputFileBuffer;
-  StringRef InputFileText = FC.CanonicalizeFile(*InputFile, InputFileBuffer);
-
-  SM.AddNewSourceBuffer(MemoryBuffer::getMemBuffer(
-                            InputFileText, InputFile->getBufferIdentifier()),
-                        SMLoc());
-
-  std::vector<FileCheckDiag> Diags;
-  int ExitCode = FC.checkInput(SM, InputFileText,
-                               DumpInput == DumpInputNever ? nullptr : &Diags)
-                     ? EXIT_SUCCESS
-                     : 1;
-  if (DumpInput == DumpInputAlways ||
-      (ExitCode == 1 && DumpInput == DumpInputFail)) {
-    errs() << "\n"
-           << "Input file: " << InputFilename << "\n"
-           << "Check file: " << CheckFilename << "\n"
-           << "\n"
-           << "-dump-input=help explains the following input dump.\n"
-           << "\n";
-    std::vector<InputAnnotation> Annotations;
-    unsigned LabelWidth;
-    BuildInputAnnotations(SM, CheckFileBufferID, ImpPatBufferIDRange, Diags,
-                          Annotations, LabelWidth);
-    DumpAnnotatedInput(errs(), Req, DumpInputFilter, DumpInputContext,
-                       InputFileText, Annotations, LabelWidth);
-  }
-
-  return ExitCode;
-}
+  virtual void resetState() override { cl::ResetAllOptionOccurrences(); }
+};
 
 int main(int argc, char **argv) {
   // Enable use of ANSI color codes because FileCheck is using them to
@@ -887,20 +896,6 @@ int main(int argc, char **argv) {
 
   InitLLVM X(argc, argv);
 
-  initializeDaemonOptions();
-
-  cl::ParseCommandLineOptions(argc, argv, /*Overview*/ "", /*Errs*/ nullptr,
-                              /*VFS*/ nullptr, "FILECHECK_OPTS");
-
-  if (daemonModeEnabled()) {
-    return runDaemonMode(
-        [&](int InvocationArgc, char **InvocationArgv, MemoryBufferRef Input) {
-          cl::ResetAllOptionOccurrences();
-          cl::ParseCommandLineOptions(InvocationArgc, InvocationArgv);
-
-          return runFileCheck(InvocationArgc, InvocationArgv, Input);
-        });
-  }
-
-  return runFileCheck(argc, argv, std::nullopt);
+  FileCheckTool Tool;
+  runWithDaemonSupport(Tool, argc, argv);
 }
