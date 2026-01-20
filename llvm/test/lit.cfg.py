@@ -11,6 +11,7 @@ import subprocess
 import lit.util
 import lit.formats
 from lit.llvm import llvm_config
+from lit.llvm.daemon_tool import invoke_llvm_daemon_tool
 from lit.llvm.subst import FindTool
 from lit.llvm.subst import ToolSubst
 
@@ -37,7 +38,17 @@ extra_substitutions = extra_substitutions = (
     if config.enable_profcheck
     else []
 )
-config.test_format = lit.formats.ShTest(not use_lit_shell, extra_substitutions)
+config.test_format = lit.formats.ShTest(
+    not use_lit_shell,
+    extra_substitutions,
+    extra_inproc_builtins = {
+        os.path.join(config.llvm_tools_dir, tool_name): (invoke_llvm_daemon_tool, True)
+        for tool_name in [
+            "opt",
+            "FileCheck",
+        ]
+    }
+)
 
 # suffixes: A list of file extensions to treat as test files. This is overriden
 # by individual lit.local.cfg files in the test subdirectories.
@@ -47,17 +58,6 @@ config.suffixes = [".ll", ".c", ".test", ".txt", ".s", ".mir", ".yaml", ".spv"]
 # subdirectories contain auxiliary inputs for various tests in their parent
 # directories.
 config.excludes = ["Inputs", "CMakeLists.txt", "README.txt", "LICENSE.txt"]
-
-# Register daemon tools.
-# TODO(BStott) better comment explaining this
-daemon_tools_module = os.path.join(config.llvm_src_root, "utils/lit/lit/llvm/daemon_tool.py")
-lit_config.inproc_builtins = {
-    os.path.join(config.llvm_tools_dir, tool_name): (daemon_tools_module, "invoke_llvm_daemon_tool", True)
-    for tool_name in [
-        "opt",
-        "FileCheck",
-    ]
-}
 
 if config.enable_profcheck:
     config.available_features.add("profcheck")

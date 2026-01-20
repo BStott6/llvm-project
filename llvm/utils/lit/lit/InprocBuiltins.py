@@ -1,8 +1,11 @@
 import getopt
-import os
+import io
+import os, subprocess
+import stat
 import pathlib
 import shutil
 import stat
+import subprocess
 from typing import Any, Callable, Tuple
 
 import lit.util
@@ -10,10 +13,61 @@ from lit.ShCommands import Command
 from lit.ShellEnvironment import ShellEnvironment, InternalShellError, kIsWindows, updateEnv
 
 
+class AppendingBytesIO:
+    """
+    Wrapper for a `BytesIO` object that performs seek(SEEK_END) after each
+    write, to match the behaviour of a file open in append mode.
+
+    It is important that the output streams for in-process builtins have
+    appending behaviour because someone writing a new in-process builtin
+    would certainly expect
+    ```
+    stdout.write("hello, ")
+    stdout.write("world")
+    ```
+    ...to write both messages to stdout, rather than having the last one
+    override the first.
+    """
+
+    inner: io.BytesIO
+
+    def __init__(self):
+        self.inner = io.BytesIO()
+
+    def write(self, buffer):
+        self.inner.write(buffer)
+        self.inner.flush()
+        self.inner.seek(0, io.SEEK_END)
+
+    def seek(self, seek_pos: int):
+        self.inner.seek(seek_pos)
+
+    def read(self, size: int = -1) -> bytes:
+        return self.inner.read(size)
+
+    def readline(self, size: int = -1):
+        return self.inner.readline(size)
+
+    def flush(self):
+        self.inner.flush()
+
+    def close(self):
+        self.inner.close()
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, AppendingBytesIO):
+            return self.inner == other.inner
+        else:
+            return False
+
+
 class InprocBuiltinIO:
     """
-    Holds IO streams for an inproc builtin invocation.
-    These may be files open in binary mode or BytesIO.
+    Holds IO streams for an inproc builtin invocation. The stdout and stderr
+    streams have appending behaviour.
+
+    NB: If stderr is redirected to be the same stream as stdout, then
+    `stder == stdout` is True.
     """
 
     stdin: Any
@@ -21,13 +75,48 @@ class InprocBuiltinIO:
     stderr: Any
 
     def __init__(self, stdin, stdout, stderr):
-        self.stdin = stdin
-        self.stdout = stdout
-        self.stderr = stderr
+        """
+        Configure the IO streams for an in-process builtin command in
+        the same way that IO streams are configured when calling
+        `subprocess.Popen`.
+
+        Each of stdin, stdout and stderr may be:
+        - A file object open in binary mode. (read for stdin, appending for
+          stdout and stderr)
+        - `subprocess.PIPE`
+        - `subprocess.STDOUT` (for stderr)
+        - None
+        """
+
+        # If stderr is redirected to stdout, we make sure to use the same
+        # stream for both so that the order of output is preserved.
+        stderr_redirected_to_stdout = (
+            stdout == subprocess.PIPE
+                and stderr == subprocess.STDOUT
+        )
+
+        # Replace sentinel values with in-memory streams.
+        if stdin == subprocess.PIPE or stdin is None:
+            self.stdin = io.BytesIO()
+        else:
+            self.stdin = stdin
+
+        if stdout == subprocess.PIPE or stdout is None:
+            self.stdout = AppendingBytesIO()
+        else:
+            self.stdout = stdout
+
+        if stderr_redirected_to_stdout:
+            # Make sure stderr and stdout are directed to the same stream.
+            self.stderr = self.stdout
+        elif stderr == subprocess.PIPE or stderr is None:
+            self.stderr = AppendingBytesIO()
+        else:
+            self.stderr = stderr
 
 
 InprocBuiltinCallable = Callable[
-    [Command, list[str], ShellEnvironment, InprocBuiltinIO], 
+    [Command, list[str], ShellEnvironment, InprocBuiltinIO],
     int,
 ]
 """
@@ -83,14 +172,6 @@ def executeBuiltinExport(cmd: Command, args: list[str], shenv: ShellEnvironment,
 def executeBuiltinEcho(cmd: Command, args: list[str], shenv: ShellEnvironment, io: InprocBuiltinIO) -> int:
     """Interpret a redirected echo or @echo command"""
     opened_files = []
-
-    if kIsWindows and False:
-        # TODO(BStott) fix this
-        # Reopen stdout with `newline=""` to avoid CRLF translation.
-        # The versions of echo we are replacing on Windows all emit plain LF,
-        # and the LLVM tests now depend on this.
-        stdout = open(f.name, f.mode, encoding="utf-8", newline="")
-        opened_files.append((None, None, stdout, None))
 
     # Implement echo flags. We only support -e and -n, and not yet in
     # combination. We have to ignore unknown flags, because `echo "-D FOO"`
@@ -317,12 +398,12 @@ def executeBuiltinColon(cmd: Command, args: list[str], cmd_shenv: ShellEnvironme
     return 0
 
 
-def getDefaultInprocBuiltins() -> dict[
+def get_default_inproc_builtins() -> dict[
     str,
     Tuple[InprocBuiltinCallable, bool],
 ]:
     """
-    getDefaultInprocBuiltins - Returns the map of command names to Lit's
+    get_default_inproc_builtins - Returns the map of command names to Lit's
     in-process built-in implementations.
     The entries are a pair of the callable for the builtin and a bool
     that determines whether this inproc builtin may fall back to a
@@ -343,4 +424,3 @@ def getDefaultInprocBuiltins() -> dict[
         "umask": (executeBuiltinUmask, False),
         ":": (executeBuiltinColon, False),
     }
-

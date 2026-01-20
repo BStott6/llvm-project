@@ -1,0 +1,2 @@
+`not --crash` cannot call in-process builtins.
+RUN: not --crash custom_echo "hello world"

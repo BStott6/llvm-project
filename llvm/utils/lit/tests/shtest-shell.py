@@ -1,4 +1,4 @@
-# Check the internal shell handling component of the ShTest format.shtest-shell
+# Check the internal shell handling component of the ShTest format.
 
 # RUN: not %{lit} -v %{inputs}/shtest-shell > %t.out
 # RUN: FileCheck --input-file %t.out %s
@@ -11,10 +11,6 @@
 # END.
 
 # CHECK: -- Testing:
-
-# CHECK: UNRESOLVED: shtest-shell :: capital-t-error-message.txt
-# CHECK: *** TEST 'shtest-shell :: capital-t-error-message.txt' FAILED ***
-# CHECK: ValueError: %T is no longer supported. Please create directories with names based on %t.
 
 # CHECK: PASS: shtest-shell :: continuations.txt
 
@@ -494,11 +490,8 @@
 #      CHECK: ***
 
 # CHECK: PASS: shtest-shell :: echo-at-redirect-stderr.txt
-
 # CHECK: PASS: shtest-shell :: echo-at-redirect-stdin.txt
-
 # CHECK: PASS: shtest-shell :: echo-redirect-stderr.txt
-
 # CHECK: PASS: shtest-shell :: echo-redirect-stdin.txt
 
 # CHECK: FAIL: shtest-shell :: error-0.txt
@@ -526,6 +519,22 @@
 # CHECK: FAIL: shtest-shell :: error-2.txt
 # CHECK: *** TEST 'shtest-shell :: error-2.txt' FAILED ***
 # CHECK: Unsupported redirect:
+# CHECK: ***
+
+# CHECK: FAIL: shtest-shell :: mkdir-error-1.txt
+# CHECK: *** TEST 'shtest-shell :: mkdir-error-1.txt' FAILED ***
+# CHECK: mkdir -p -m 777 temp
+# CHECK: # .---command stderr{{-*}}
+# CHECK: # | Unsupported: 'mkdir': option -m not recognized
+# CHECK: # error: command failed with exit status: 127
+# CHECK: ***
+
+# CHECK: FAIL: shtest-shell :: mkdir-error-2.txt
+# CHECK: *** TEST 'shtest-shell :: mkdir-error-2.txt' FAILED ***
+# CHECK: mkdir -p
+# CHECK: # .---command stderr{{-*}}
+# CHECK: # | Error: 'mkdir' is missing an operand
+# CHECK: # error: command failed with exit status: 127
 # CHECK: ***
 
 # CHECK: FAIL: shtest-shell :: pipefail.txt
@@ -573,5 +582,5 @@
 #      CHECK: ***
 
 # CHECK: PASS: shtest-shell :: valid-shell.txt
-# CHECK: Unresolved Tests (2)
+# CHECK: Unresolved Tests (1)
 # CHECK: Failed Tests (30)

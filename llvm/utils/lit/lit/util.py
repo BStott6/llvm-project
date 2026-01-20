@@ -441,7 +441,3 @@ def killProcessAndChildren(pid):
             psutilProc.kill()
         except psutil.NoSuchProcess:
             pass
-
-def has_method(obj, method_name):
-    attr = getattr(obj, method_name)
-    return attr and callable(attr)
