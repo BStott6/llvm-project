@@ -1,0 +1,2 @@
+# `env` cannot call in-process builtins.
+RUN: env custom_echo "hello world"
