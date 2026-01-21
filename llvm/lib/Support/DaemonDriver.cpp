@@ -217,12 +217,12 @@ private:
     // Invoke the tool.
     int ExitCode;
     {
-      std::optional<ScopedFileRedirect> StderrRedirect; 
+      std::optional<ScopedFileRedirect> StderrRedirect;
       if (RedirectStderrToStdout)
         StderrRedirect.emplace(STDERR_FILENO, STDOUT_FILENO);
 
       ExitCode = Tool.run(ArgsCStr.size(), ArgsCStr.data(),
-                                    MemoryBufferRef(ToolInput, "<stdin>"));
+                          MemoryBufferRef(ToolInput, "<stdin>"));
     }
 
     // Reset state for the next invocation.
@@ -371,6 +371,5 @@ LLVM_ABI int llvm::runWithDaemonSupport(LLVMTool &Tool, int Argc, char **Argv) {
     return runDaemonMode(Tool, Argc, Argv);
   }
 
-  // Otherwise run normally.
   return Tool.run(Argc, Argv, std::nullopt);
 }

@@ -73,6 +73,7 @@ set(LLVM_TEST_DEPENDS
   BugpointPasses
   LLVMWindowsDriver
   bugpoint
+  ExampleDaemon
   llc
   lli
   lli-child-target
