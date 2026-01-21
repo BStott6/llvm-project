@@ -10,7 +10,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
-from lit.InprocBuiltins import get_default_inproc_builtins, InprocBuiltinCallable, InprocBuiltinIO
+from lit.InprocBuiltins import get_default_inproc_builtins, InprocBuiltin, InprocBuiltinIO
 from lit.ShCommands import Command, Pipeline
 from lit.ShellEnvironment import *
 import lit.ShUtil as ShUtil
@@ -394,7 +394,7 @@ def invoke_process(
 
 
 def invoke_inproc_builtin(
-    run: InprocBuiltinCallable,
+    inproc_builtin: InprocBuiltin,
     command: Command,
     args: list[str],
     stdin: Any,
@@ -404,7 +404,7 @@ def invoke_inproc_builtin(
 ):
     builtin_io = InprocBuiltinIO(stdin, stdout, stderr)
 
-    exit_code = run(command, args, cmd_shenv, builtin_io)
+    exit_code = inproc_builtin.run(command, args, cmd_shenv, builtin_io)
 
     # Make sure that the output is flushed, in case the next process
     # tries to read it from a file (as temporary files are not closed
@@ -534,7 +534,7 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
             #
         # FIXME: Standardize on the builtin echo implementation. We can use a
         # temporary file to sidestep blocking pipe write issues.
-        inproc_builtin, may_fallback = inproc_builtins.get(args[0], (None, False))
+        inproc_builtin = inproc_builtins.get(args[0], None)
 
         error = None
         if inproc_builtin:
@@ -546,11 +546,12 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
             if not cmd_shenv is shenv:
                 error = "Error: 'env' cannot call '{}'".format(args[0])
 
-        if error:
-            if may_fallback:
-                inproc_builtin = None
-            else:
-                raise InternalShellError(j, error)
+            if error:
+                if inproc_builtin.fallback:
+                    args[0] = inproc_builtin.fallback
+                    inproc_builtin = None
+                else:
+                    raise InternalShellError(j, error)
 
         # Resolve any out-of-process builtin command before adding back 'not'
         # commands.
@@ -875,7 +876,7 @@ def executeScriptInternal(
             out += result.stdout
             err += result.stderr
             continue
-
+        
         # The purpose of an "@echo" command is merely to add a debugging message
         # directly to lit's output.  It is used internally by lit's internal
         # shell and is not currently documented for use in lit tests.  However,

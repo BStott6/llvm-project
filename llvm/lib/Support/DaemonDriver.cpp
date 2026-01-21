@@ -15,6 +15,7 @@
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ScopedFileRedirect.h"
 #include <cstdio>
@@ -326,6 +327,10 @@ private:
 };
 
 int runDaemonMode(LLVMTool &Tool, int Argc, char **Argv) {
+  sys::ChangeStdinToBinary();
+  sys::ChangeStdoutToBinary();
+  sys::ChangeStderrToBinary();
+
   // Parse daemon command line options.
   initializeDaemonOptions();
   cl::ParseCommandLineOptions(Argc, Argv);

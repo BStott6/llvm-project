@@ -39,6 +39,7 @@ class ToolSubst(object):
         self,
         key,
         command=None,
+        daemon_command=None,
         pre=r".-^/\<",
         post="-.",
         verbatim=False,
@@ -81,6 +82,7 @@ class ToolSubst(object):
         self.extra_args = extra_args
         self.key = key
         self.command = command if command is not None else FindTool(key)
+        self.daemon_command = daemon_command
         self.was_resolved = False
         if verbatim:
             self.regex = key
@@ -100,7 +102,7 @@ class ToolSubst(object):
 
         self.regex = not_in(pre, "<") + wordify(key) + not_in(post)
 
-    def resolve(self, config, search_dirs):
+    def resolve(self, config, search_dirs, allow_daemon=True):
         # Extract the tool name from the pattern. This relies on the tool name
         # being surrounded by \b word match operators. If the pattern starts
         # with "| ", include it in the string to be substituted.
@@ -112,37 +114,41 @@ class ToolSubst(object):
         tool_pipe = tool_match.group(2)
         tool_name = tool_match.group(4)
 
-        if isinstance(self.command, FindTool):
-            command_str = self.command.resolve(config, search_dirs)
+        if allow_daemon and self.daemon_command:
+            command_str = self.daemon_command
         else:
-            command_str = str(self.command)
-
-        if command_str:
-            if self.extra_args:
-                command_str = " ".join([command_str] + self.extra_args)
-        else:
-            if self.unresolved == "warn":
-                # Warn, but still provide a substitution.
-                config.lit_config.note(
-                    "Did not find " + tool_name + " in %s" % search_dirs
-                )
-                command_str = os.path.join(config.config.llvm_tools_dir, tool_name)
-            elif self.unresolved == "fatal":
-                # The function won't even return in this case, this leads to
-                # sys.exit
-                config.lit_config.fatal(
-                    "Did not find " + tool_name + " in %s" % search_dirs
-                )
-            elif self.unresolved == "break":
-                # By returning a valid result with an empty command, the
-                # caller treats this as a failure.
-                pass
-            elif self.unresolved == "ignore":
-                # By returning None, the caller just assumes there was no
-                # match in the first place.
-                return None
+            if isinstance(self.command, FindTool):
+                command_str = self.command.resolve(config, search_dirs)
             else:
-                raise "Unexpected value for ToolSubst.unresolved"
-        if command_str:
-            self.was_resolved = True
+                command_str = str(self.command)
+
+            if command_str:
+                if self.extra_args:
+                    command_str = " ".join([command_str] + self.extra_args)
+            else:
+                if self.unresolved == "warn":
+                    # Warn, but still provide a substitution.
+                    config.lit_config.note(
+                        "Did not find " + tool_name + " in %s" % search_dirs
+                    )
+                    command_str = os.path.join(config.config.llvm_tools_dir, tool_name)
+                elif self.unresolved == "fatal":
+                    # The function won't even return in this case, this leads to
+                    # sys.exit
+                    config.lit_config.fatal(
+                        "Did not find " + tool_name + " in %s" % search_dirs
+                    )
+                elif self.unresolved == "break":
+                    # By returning a valid result with an empty command, the
+                    # caller treats this as a failure.
+                    pass
+                elif self.unresolved == "ignore":
+                    # By returning None, the caller just assumes there was no
+                    # match in the first place.
+                    return None
+                else:
+                    raise "Unexpected value for ToolSubst.unresolved"
+            if command_str:
+                self.was_resolved = True
+
         return (self.regex, tool_pipe, command_str)

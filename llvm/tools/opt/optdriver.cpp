@@ -411,6 +411,9 @@ public:
 
   virtual int run(int Argc, char **Argv,
                   std::optional<MemoryBufferRef> StdinOverride) override {
+    cl::ParseCommandLineOptions(
+        Argc, Argv, "llvm .bc -> .bc modular optimizer and analysis printer\n");
+
     SmallVector<PassPlugin, 1> PluginList;
     PassPlugins.setCallback([&](const std::string &PluginPath) {
       auto Plugin = PassPlugin::Load(PluginPath);
@@ -973,9 +976,6 @@ optMain(int argc, char **argv,
 
   // Register the Target and CPU printer for --version.
   cl::AddExtraVersionPrinter(sys::printDefaultTargetAndDetectedCPU);
-
-  cl::ParseCommandLineOptions(
-      argc, argv, "llvm .bc -> .bc modular optimizer and analysis printer\n");
 
   OptTool Tool(PassBuilderCallbacks);
   return runWithDaemonSupport(Tool, argc, argv);

@@ -11,7 +11,7 @@ import subprocess
 import lit.util
 import lit.formats
 from lit.llvm import llvm_config
-from lit.llvm.daemon_tool import invoke_llvm_daemon_tool
+from lit.llvm.daemon_tool import get_llvm_daemon_inproc_builtin, invoke_llvm_daemon_tool
 from lit.llvm.subst import FindTool
 from lit.llvm.subst import ToolSubst
 
@@ -42,10 +42,15 @@ config.test_format = lit.formats.ShTest(
     not use_lit_shell,
     extra_substitutions,
     extra_inproc_builtins = {
-        os.path.join(config.llvm_tools_dir, tool_name): (invoke_llvm_daemon_tool, True)
-        for tool_name in [
-            "opt",
-            "FileCheck",
+        daemon_command:
+            get_llvm_daemon_inproc_builtin(
+                tool_name,
+                llvm_config,
+                [config.llvm_tools_dir],
+            )
+        for daemon_command, tool_name in [
+            ("%FileCheck-daemon", "FileCheck"),
+            ("%opt-daemon", "opt"),
         ]
     }
 )
@@ -136,7 +141,7 @@ def get_asan_rtlib():
     return found_dylibs[0]
 
 
-llvm_config.use_default_substitutions()
+llvm_config.use_default_substitutions(add_filecheck=False)
 
 # Add site-specific substitutions.
 config.substitutions.append(("%llvmshlibdir", config.llvm_shlib_dir))
@@ -237,6 +242,10 @@ tools = [
 # FIXME: Why do we have both `lli` and `%lli` that do slightly different things?
 tools.extend(
     [
+        ToolSubst("FileCheck", daemon_command="%FileCheck-daemon"),
+        ToolSubst("%FileCheck-standalone", FindTool("FileCheck")),
+        ToolSubst("opt", daemon_command="%opt-daemon"),
+        ToolSubst("%opt-standalone", FindTool("opt")),
         "dsymutil",
         "lli",
         "lli-child-target",
@@ -307,7 +316,6 @@ tools.extend(
         "bugpoint",
         "llc",
         "llvm-symbolizer",
-        "opt",
         "sancov",
         "sanstats",
         "llvm-remarkutil",

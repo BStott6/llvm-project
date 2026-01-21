@@ -6,7 +6,8 @@ import pathlib
 import shutil
 import stat
 import subprocess
-from typing import Any, Callable, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Tuple
 
 import lit.util
 from lit.ShCommands import Command
@@ -129,6 +130,12 @@ Parameters:
 
 The return value is the exit code.
 """
+
+
+@dataclass
+class InprocBuiltin:
+    run: InprocBuiltinCallable
+    fallback: Optional[str] = None
 
 
 def executeBuiltinCd(cmd: Command, args: list[str], shenv: ShellEnvironment, io: InprocBuiltinIO) -> int:
@@ -398,10 +405,7 @@ def executeBuiltinColon(cmd: Command, args: list[str], cmd_shenv: ShellEnvironme
     return 0
 
 
-def get_default_inproc_builtins() -> dict[
-    str,
-    Tuple[InprocBuiltinCallable, bool],
-]:
+def get_default_inproc_builtins() -> dict[str, InprocBuiltin]:
     """
     get_default_inproc_builtins - Returns the map of command names to Lit's
     in-process built-in implementations.
@@ -412,15 +416,15 @@ def get_default_inproc_builtins() -> dict[
     """
 
     return {
-        "@echo": (executeBuiltinEcho, False),
-        "cd": (executeBuiltinCd, False),
-        "export": (executeBuiltinExport, False),
-        "echo": (executeBuiltinEcho, False),
-        "mkdir": (executeBuiltinMkdir, False),
-        "popd": (executeBuiltinPopd, False),
-        "pushd": (executeBuiltinPushd, False),
-        "rm": (executeBuiltinRm, False),
-        "ulimit": (executeBuiltinUlimit, False),
-        "umask": (executeBuiltinUmask, False),
-        ":": (executeBuiltinColon, False),
+        "@echo": InprocBuiltin(executeBuiltinEcho, None),
+        "cd": InprocBuiltin(executeBuiltinCd, None),
+        "export": InprocBuiltin(executeBuiltinExport, None),
+        "echo": InprocBuiltin(executeBuiltinEcho, None),
+        "mkdir": InprocBuiltin(executeBuiltinMkdir, None),
+        "popd": InprocBuiltin(executeBuiltinPopd, None),
+        "pushd": InprocBuiltin(executeBuiltinPushd, None),
+        "rm": InprocBuiltin(executeBuiltinRm, None),
+        "ulimit": InprocBuiltin(executeBuiltinUlimit, None),
+        "umask": InprocBuiltin(executeBuiltinUmask, None),
+        ":": InprocBuiltin(executeBuiltinColon, None),
     }
