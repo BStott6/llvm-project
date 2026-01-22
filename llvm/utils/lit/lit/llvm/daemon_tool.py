@@ -188,13 +188,13 @@ class DaemonTool:
         # On Windows, only the file handle (not the file descriptor) is
         # inherited.
         if kIsWindows:
-            args.append(f"--daemon-status-handle={status_pipe_handle}")
+            args.append(f"--daemon-status-pipe=handle:{status_pipe_handle}")
             startupinfo = subprocess.STARTUPINFO(
                 lpAttributeList={"handle_list": [status_pipe_handle]},
             )
             pass_fds = None
         else:
-            args.append(f"--daemon-status-fd={status_pipe_writer}")
+            args.append(f"--daemon-status-pipe=fd:{status_pipe_writer}")
             startupinfo = None
             pass_fds = [status_pipe_writer]
 

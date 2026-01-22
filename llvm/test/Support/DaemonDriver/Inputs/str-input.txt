@@ -1,0 +1,7 @@
+in.str 5
+aBcDerun ExampleDaemon
+in.str 8
+aBcDeFgHrun ExampleDaemon --separate-lowercase-instead
+in.str 4
+aaaarun ExampleDaemon
+exit

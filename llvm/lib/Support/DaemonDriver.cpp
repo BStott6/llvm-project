@@ -1,4 +1,4 @@
-//===- llvm/Support/DaemonDriver.cpp - Daemon driver interface --*- C++ -*-===//
+//===- llvm/Support/DaemonDriver.cpp - Daemon driver interface --Options.StatusPipe C++ -*-===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -16,8 +16,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/ScopedFileRedirect.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -46,43 +46,37 @@ constexpr int StatusInitError = 2;
 /// Status code returned if the daemon receives a malformed command.
 constexpr int StatusCommandError = 3;
 
-static bool DaemonMode;
-static int DaemonStatusFd;
-static int DaemonStatusHandle;
+struct DaemonCommandLineOptions {
+  bool DaemonModeEnabled;
+  std::string StatusPipe;
+};
 
 /// This should only be used before the status pipe is set up - after,
 /// errors are reported to the user via the status pipe.
-[[noreturn]] void reportInitError(const Twine &Err) {
-  llvm::errs() << "[daemon] error: " << Err << "\n";
+[[noreturn]] static void reportInitError(const Twine &Err) {
+  llvm::errs() << "[daemon] Error: " << Err << "\n";
   std::exit(StatusInitError);
 }
 
-bool detectDaemonArg(int Argc, char **Argv) {
+static bool detectDaemonArg(int Argc, char **Argv) {
   // `--daemon` must be the first argument.
   return Argc >= 2 && StringRef("--daemon") == Argv[1];
 }
 
-void initializeDaemonOptions() {
-  static cl::OptionCategory DaemonCategory(
-      "Daemon Options", "Options for running tools in daemon mode");
+static const DaemonCommandLineOptions &getDaemonCommandLineOptions() {
+  static DaemonCommandLineOptions Options;
 
-  static cl::opt<bool, true> DaemonModeOpt(
-      "daemon", cl::cat(DaemonCategory), cl::ReallyHidden,
-      cl::location(DaemonMode), cl::init(false));
+  static cl::opt<bool, true> DaemonModeEnabledOpt(
+      "daemon", cl::location(Options.DaemonModeEnabled), cl::init(false));
 
-  static cl::opt<int, true> DaemonStatusFdOpt(
-      "daemon-status-fd",
-      cl::desc("File descriptor to which the daemon tool will send status "
-               "messages."),
-      cl::cat(DaemonCategory), cl::ReallyHidden, cl::location(DaemonStatusFd),
-      cl::init(-1));
+  static cl::opt<std::string, true> StatusPipeOpt(
+      "daemon-status-pipe",
+      cl::desc("File to which the daemon tool will send status messages. May "
+               "be 'path:{filepath}', 'fd:{file descriptor}' or "
+               "'handle:{Windows file handle}'"),
+      cl::location(Options.StatusPipe), cl::init(""));
 
-  static cl::opt<int, true> DaemonStatusHandleOpt(
-      "daemon-status-handle",
-      cl::desc("Windows file handle to which the daemon tool will send status "
-               "messages."),
-      cl::cat(DaemonCategory), cl::ReallyHidden,
-      cl::location(DaemonStatusHandle), cl::init(-1));
+  return Options;
 }
 
 /// Utility to read an input stream line-by-line.
@@ -115,8 +109,9 @@ private:
 
 class DaemonDriver {
 public:
-  DaemonDriver(LLVMTool &Tool, const int StatusPipeFd)
-      : Tool(Tool), StatusPipeWriter(createStatusPipeWriter(StatusPipeFd)) {};
+  DaemonDriver(LLVMTool &Tool, const DaemonCommandLineOptions &Options)
+      : Tool(Tool),
+        StatusPipeWriter(createStatusPipeWriter(Options.StatusPipe)) {};
 
   int run() {
     LineReader StdinReader(stdin);
@@ -179,27 +174,72 @@ private:
   static constexpr StringRef MessageReturned = "returned";
   static constexpr StringRef MessageError = "error";
 
-  static raw_fd_ostream createStatusPipeWriter(const int Fd) {
+  static std::unique_ptr<raw_ostream>
+  createStatusPipeWriter(StringRef StatusPipeString) {
+    // `StatusPipeString` may be:
+    // - "path:{file path}"
+    // - "fd:{file descriptor}"
+    // - "handle:{Windows file handle}"
+    constexpr StringRef ErrorContext = "Parsing option 'daemon-status-pipe': ";
+
+    if (StatusPipeString.consume_front("path:")) {
+      std::error_code EC;
+      auto Writer =
+          std::make_unique<raw_fd_ostream>(StatusPipeString.trim(), EC);
+      if (EC) {
+        reportInitError(ErrorContext + "Couldn't open file '" +
+                        StatusPipeString + "': " + EC.message());
+      }
+      Writer->SetUnbuffered();
+      return Writer;
+    }
+
+    int Fd;
+    if (StatusPipeString.consume_front("fd:")) {
+      bool Err = StatusPipeString.consumeInteger(10, Fd);
+      if (Err) {
+        reportInitError(ErrorContext + "expected integer "
+                                       "after 'fd:'.");
+      }
+    } else if (StatusPipeString.consume_front("handle:")) {
+#ifdef _WIN32
+      int Handle;
+      bool Err = StatusPipeString.consumeInteger(10, Handle);
+      if (Err) {
+        reportInitError("Parsing option 'daemon-status-pipe': expected integer "
+                        "after 'handle:'.");
+      }
+
+      Fd = _open_osfhandle(Handle, 0);
+#endif
+      reportInitError(ErrorContext + "'handle' may only "
+                                     "be specified on Windows");
+    } else {
+      reportInitError(ErrorContext + "Unexpected value : '" +
+                      StatusPipeString + "'");
+    }
+
     // Only close the status pipe if it is not a standard stream.
     const bool ShouldClose = Fd != STDOUT_FILENO && Fd != STDERR_FILENO;
 
-    return raw_fd_ostream(Fd, ShouldClose, /*unbuffered=*/true);
+    return std::make_unique<raw_fd_ostream>(Fd, ShouldClose,
+                                            /*unbuffered=*/true);
   }
 
   [[noreturn]] void reportCommandError(const Twine &Err) {
-    StatusPipeWriter << MessageError << ' ' << Err << "\n";
-    StatusPipeWriter.flush();
+    *StatusPipeWriter << MessageError << ' ' << Err << "\n";
+    StatusPipeWriter->flush();
     std::exit(StatusCommandError);
   }
 
   void messageOk() {
-    StatusPipeWriter << MessageOk << "\n";
-    StatusPipeWriter.flush();
+    *StatusPipeWriter << MessageOk << "\n";
+    StatusPipeWriter->flush();
   }
 
   void messageReturned(const int ExitCode) {
-    StatusPipeWriter << MessageReturned << ' ' << ExitCode << "\n";
-    StatusPipeWriter.flush();
+    *StatusPipeWriter << MessageReturned << ' ' << ExitCode << "\n";
+    StatusPipeWriter->flush();
   }
 
   void runTool(const StringRef Command) {
@@ -322,7 +362,7 @@ private:
 
   LLVMTool &Tool;
   std::string ToolInput;
-  raw_fd_ostream StatusPipeWriter;
+  std::unique_ptr<raw_ostream> StatusPipeWriter;
   bool RedirectStderrToStdout = false;
 };
 
@@ -332,36 +372,10 @@ int runDaemonMode(LLVMTool &Tool, int Argc, char **Argv) {
   sys::ChangeStderrToBinary();
 
   // Parse daemon command line options.
-  initializeDaemonOptions();
+  const DaemonCommandLineOptions &Options = getDaemonCommandLineOptions();
   cl::ParseCommandLineOptions(Argc, Argv);
 
-  if (DaemonStatusFd < 0 && DaemonStatusHandle < 0) {
-    reportInitError("Must provide either `--daemon-status-fd` or "
-                    "`--daemon-status-handle (Windows-only)`");
-  }
-  if (DaemonStatusFd >= 0 && DaemonStatusHandle >= 0) {
-    reportInitError("Cannot provide both `--daemon-status-fd` and "
-                    "`--daemon-status-handle`");
-  }
-
-#ifdef _WIN32
-  const int StatusPipeFd = [] {
-    if (DaemonStatusHandle >= 0) {
-      return _open_osfhandle(DaemonStatusHandle, 0);
-    }
-    return DaemonStatusFd;
-  }();
-#else
-  if (DaemonStatusHandle >= 0) {
-    reportInitError(
-        "`--daemon-status-handle` should only be passed on Windows.");
-  }
-  const int StatusPipeFd = DaemonStatusFd;
-#endif
-
-  cl::ResetAllOptionOccurrences();
-
-  DaemonDriver Driver(Tool, StatusPipeFd);
+  DaemonDriver Driver(Tool, Options);
   return Driver.run();
 }
 } // namespace

@@ -74,7 +74,7 @@ public:
 
   virtual void resetState() override {
     PersistentState = PersistentStateInit;
-    cl::ResetCommandLineParser();
+    cl::ResetAllOptionOccurrences();
   }
 };
 

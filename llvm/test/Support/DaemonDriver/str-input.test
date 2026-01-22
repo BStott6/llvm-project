@@ -1,0 +1,17 @@
+This test verifies that the tool gives the correct output when the input is provided with "in.str".
+RUN: ExampleDaemon --daemon --daemon-status-pipe=path:%t.status < %S/Inputs/str-input.txt > %t.stdout 2> %t.stderr
+RUN: FileCheck < %t.stdout %s --check-prefix=CHECK-STDOUT
+RUN: FileCheck < %t.stderr %s --check-prefix=CHECK-STDERR
+RUN: FileCheck < %t.status %s --check-prefix=CHECK-STATUS
+END.
+CHECK-STATUS: ok
+CHECK-STATUS: ok
+CHECK-STATUS: ok
+CHECK-STDOUT: ac
+CHECK-STDERR: BD
+CHECK-STATUS: returned 2
+CHECK-STDOUT: BDFH
+CHECK-STDERR: aceg
+CHECK-STATUS: returned 4
+CHECK-STDOUT: aaaa
+CHECK-STATUS: returned 0
