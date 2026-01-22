@@ -1,0 +1,6 @@
+in.str 8
+aBcDeFgHredirect_stderr_to_stdout
+run ExampleDaemon
+in.str 8
+aaaaAAAArun ExampleDaemon
+exit

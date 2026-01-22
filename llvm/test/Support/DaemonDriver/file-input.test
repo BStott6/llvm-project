@@ -1,6 +1,6 @@
 # This test verifies that the tool gives the correct output when the input is
-# provided with "in.str".
-RUN: ExampleDaemon --daemon --daemon-status-pipe=path:%t.status < %S/Inputs/str-input.txt > %t.stdout 2> %t.stderr
+# provided with "in.file".
+RUN: sed 's@SOURCEDIR@%{/S:regex_replacement}@g' %S/Inputs/file-input.txt | ExampleDaemon --daemon --daemon-status-pipe=path:%t.status > %t.stdout 2> %t.stderr
 RUN: FileCheck < %t.stdout %s --check-prefix=CHECK-STDOUT --strict-whitespace
 RUN: FileCheck < %t.stderr %s --check-prefix=CHECK-STDERR --strict-whitespace
 RUN: FileCheck < %t.status %s --check-prefix=CHECK-STATUS --strict-whitespace
@@ -16,11 +16,10 @@ CHECK-STDERR: BD
 # 2nd command.
 CHECK-STATUS-NEXT: ok
 CHECK-STATUS-NEXT: returned 4
-CHECK-STDOUT-SAME: BDFH
+CHECK-STDOUT-NEXT: BDFH
 CHECK-STDERR-SAME: aceg
 
 # 3rd command.
 CHECK-STATUS-NEXT: ok
 CHECK-STATUS-NEXT: returned 0
-CHECK-STDOUT-SAME: aaaa
-
+CHECK-STDOUT-NEXT: aaaa

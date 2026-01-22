@@ -16,7 +16,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
-#include "llvm/Support/ScopedFileRedirect.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +23,19 @@
 
 #if defined _WIN32
 #include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+// Windows emulated POSIX functions are prefixed by `_`.
+#ifdef _WIN32
+#define CLOSE_FN _close
+#define DUP_FN _dup
+#define DUP2_FN _dup2
+#else
+#define CLOSE_FN close
+#define DUP_FN dup
+#define DUP2_FN dup2
 #endif
 
 // Standard stream fileno macros are not defined on Windows.
@@ -36,49 +48,10 @@
 #ifndef STDERR_FILENO
 #define STDERR_FILENO 2
 #endif
-
 using namespace llvm;
 
 namespace {
-/// Status code returned if the daemon fails to initialize, for example due to
-/// incorrect command line arguments.
-constexpr int StatusInitError = 2;
-/// Status code returned if the daemon receives a malformed command.
-constexpr int StatusCommandError = 3;
-
-struct DaemonCommandLineOptions {
-  bool DaemonModeEnabled;
-  std::string StatusPipe;
-};
-
-/// This should only be used before the status pipe is set up - after,
-/// errors are reported to the user via the status pipe.
-[[noreturn]] static void reportInitError(const Twine &Err) {
-  llvm::errs() << "[daemon] Error: " << Err << "\n";
-  std::exit(StatusInitError);
-}
-
-static bool detectDaemonArg(int Argc, char **Argv) {
-  // `--daemon` must be the first argument.
-  return Argc >= 2 && StringRef("--daemon") == Argv[1];
-}
-
-static const DaemonCommandLineOptions &getDaemonCommandLineOptions() {
-  static DaemonCommandLineOptions Options;
-
-  static cl::opt<bool, true> DaemonModeEnabledOpt(
-      "daemon", cl::location(Options.DaemonModeEnabled), cl::init(false));
-
-  static cl::opt<std::string, true> StatusPipeOpt(
-      "daemon-status-pipe",
-      cl::desc("File to which the daemon tool will send status messages. May "
-               "be 'path:{filepath}', 'fd:{file descriptor}' or "
-               "'handle:{Windows file handle}'"),
-      cl::location(Options.StatusPipe), cl::init(""));
-
-  return Options;
-}
-
+namespace util {
 /// Utility to read an input stream line-by-line.
 class LineReader {
 public:
@@ -86,7 +59,7 @@ public:
 
   std::string readLine() {
     std::string Result;
-    llvm::raw_string_ostream ResultWriter(Result);
+    raw_string_ostream ResultWriter(Result);
 
     constexpr size_t BufSize = 512;
     char Buf[BufSize];
@@ -107,6 +80,95 @@ private:
   FILE *File;
 };
 
+/// RAII mechanism to redirect a file descriptor to the file pointed to by a
+/// different file descriptor. The destructor will reset the file descriptor to
+/// its original file.
+class ScopedFileRedirect {
+public:
+  /// Redirect `FromFd` to the same file as `ToFd` for the lifetime of this
+  /// object.
+  ScopedFileRedirect(int FromFd, int ToFd) : FromFd(FromFd) {
+    // Store a copy of the original file so that we can restore the original fd
+    // to this copy.
+    CopyFd = DUP_FN(FromFd);
+
+    // Close the source fd and reopen it to the target fd.
+    DUP2_FN(ToFd, FromFd);
+  }
+
+  ~ScopedFileRedirect() {
+    if (!Moved) {
+      // Close the source fd and reopen it to the original file.
+      DUP2_FN(CopyFd, FromFd);
+
+      // Close the copied file descriptor, as it's no longer needed.
+      CLOSE_FN(CopyFd);
+    }
+  }
+
+  ScopedFileRedirect(ScopedFileRedirect &&Other) {
+    *this = Other;
+    Other.Moved = true;
+  }
+  ScopedFileRedirect &operator=(ScopedFileRedirect &&Other) {
+    *this = Other;
+    Other.Moved = true;
+    return *this;
+  }
+
+private:
+  ScopedFileRedirect(const ScopedFileRedirect &Other) = default;
+  ScopedFileRedirect &operator=(const ScopedFileRedirect &Other) = default;
+
+  int FromFd;
+  int CopyFd;
+  bool Moved = false;
+};
+} // namespace util
+
+/// Status code returned if the daemon fails to initialize, for example due to
+/// incorrect command line arguments.
+constexpr int StatusInitError = 2;
+/// Status code returned if the daemon receives a malformed command.
+constexpr int StatusCommandError = 3;
+
+/// This should only be used before the status pipe is set up - after,
+/// errors are reported to the user via the status pipe.
+[[noreturn]] static void reportInitError(const Twine &Err) {
+  errs() << "[daemon] Error: " << Err << "\n";
+  std::exit(StatusInitError);
+}
+
+/// Returns true if ``--daemon`` is passed as the first command line argument.
+static bool detectDaemonArg(int Argc, char **Argv) {
+  // `--daemon` must be the first argument.
+  return Argc >= 2 && StringRef("--daemon") == Argv[1];
+}
+
+struct DaemonCommandLineOptions {
+  bool DaemonModeEnabled;
+  std::string StatusPipe;
+};
+
+// Creates the command line options for configuring the daemon. The returned
+// reference points to a static struct where the option values will be stored.
+static const DaemonCommandLineOptions &initializeDaemonCommandLineOptions() {
+  static DaemonCommandLineOptions Options;
+
+  static cl::opt<bool, true> DaemonModeEnabledOpt(
+      "daemon", cl::location(Options.DaemonModeEnabled), cl::init(false));
+
+  static cl::opt<std::string, true> StatusPipeOpt(
+      "daemon-status-pipe",
+      cl::desc("File to which the daemon tool will send status messages. May "
+               "be 'path:{filepath}', 'fd:{file descriptor}' or "
+               "'handle:{Windows file handle}'"),
+      cl::location(Options.StatusPipe), cl::init(""));
+
+  return Options;
+}
+
+/// This class implements the daemon driver functionality.
 class DaemonDriver {
 public:
   DaemonDriver(LLVMTool &Tool, const DaemonCommandLineOptions &Options)
@@ -114,7 +176,7 @@ public:
         StatusPipeWriter(createStatusPipeWriter(Options.StatusPipe)) {};
 
   int run() {
-    LineReader StdinReader(stdin);
+    util::LineReader StdinReader(stdin);
 
     // Inform the user that the daemon is ready to receive commands.
     messageOk();
@@ -143,8 +205,6 @@ public:
           reportCommandError("Unexpected trailing characters in command: " +
                              Command);
         }
-        messageOk();
-
         readInputFromStdin(Len);
       } else if (Remaining.consume_front(CommandExit)) {
         break;
@@ -179,7 +239,7 @@ private:
     // `StatusPipeString` may be:
     // - "path:{file path}"
     // - "fd:{file descriptor}"
-    // - "handle:{Windows file handle}"
+    // - "handle:{Windows file handle}" (Windows-only)
     constexpr StringRef ErrorContext = "Parsing option 'daemon-status-pipe': ";
 
     if (StatusPipeString.consume_front("path:")) {
@@ -206,7 +266,8 @@ private:
       int Handle;
       bool Err = StatusPipeString.consumeInteger(10, Handle);
       if (Err) {
-        reportInitError("Parsing option 'daemon-status-pipe': expected integer "
+        reportInitError(ErrorContext +
+                        "Parsing option 'daemon-status-pipe': expected integer "
                         "after 'handle:'.");
       }
 
@@ -221,7 +282,6 @@ private:
 
     // Only close the status pipe if it is not a standard stream.
     const bool ShouldClose = Fd != STDOUT_FILENO && Fd != STDERR_FILENO;
-
     return std::make_unique<raw_fd_ostream>(Fd, ShouldClose,
                                             /*unbuffered=*/true);
   }
@@ -257,7 +317,7 @@ private:
     // Invoke the tool.
     int ExitCode;
     {
-      std::optional<ScopedFileRedirect> StderrRedirect;
+      std::optional<util::ScopedFileRedirect> StderrRedirect;
       if (RedirectStderrToStdout)
         StderrRedirect.emplace(STDERR_FILENO, STDOUT_FILENO);
 
@@ -271,8 +331,8 @@ private:
     RedirectStderrToStdout = false;
 
     // Make sure the user gets all the output.
-    llvm::outs().flush();
-    llvm::errs().flush();
+    outs().flush();
+    errs().flush();
 
     // Inform the user that the command has finished and provide the exit code.
     messageReturned(ExitCode);
@@ -292,6 +352,11 @@ private:
   }
 
   void readInputFromStdin(const size_t Len) {
+    // Ensure stdin is in binary mode to prevent newline translation on Windows
+    // - this not only breaks binary files but also muddles the number of
+    // characters read.
+    sys::ChangeStdinToBinary();
+
     // Read `Len` bytes into `ToolInput`.
     ToolInput.clear();
     ToolInput.resize(Len);
@@ -366,13 +431,9 @@ private:
   bool RedirectStderrToStdout = false;
 };
 
-int runDaemonMode(LLVMTool &Tool, int Argc, char **Argv) {
-  sys::ChangeStdinToBinary();
-  sys::ChangeStdoutToBinary();
-  sys::ChangeStderrToBinary();
-
+static int runDaemonMode(LLVMTool &Tool, int Argc, char **Argv) {
   // Parse daemon command line options.
-  const DaemonCommandLineOptions &Options = getDaemonCommandLineOptions();
+  const DaemonCommandLineOptions &Options = initializeDaemonCommandLineOptions();
   cl::ParseCommandLineOptions(Argc, Argv);
 
   DaemonDriver Driver(Tool, Options);

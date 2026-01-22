@@ -1,0 +1,7 @@
+in.file SOURCEDIR/Inputs/file-input-1.txt
+run ExampleDaemon
+in.file SOURCEDIR/Inputs/file-input-2.txt
+run ExampleDaemon --separate-lowercase-instead
+in.file SOURCEDIR/Inputs/file-input-3.txt
+run ExampleDaemon
+exit

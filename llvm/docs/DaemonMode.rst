@@ -5,11 +5,6 @@ Running Tools in Daemon Mode
 .. contents::
    :local:
 
-Introduction
-============
-
-TODO(BStott)
-
 Adding Daemon Support to a Tool
 ===============================
 
@@ -55,9 +50,9 @@ newline. The following commands are accepted:
    use the content of the file as the standard input for the next ``run``. If
    the file is loaded successfully, the daemon will send an ``ok`` message.
 #. ``in.str``: This command is followed by an integer indicating a number of
-   bytes. The daemon will send an ``ok`` message, and then read this many bytes
-   from ``stdin`` and use this as the standard input for the next ``run``.
-   Another ``ok`` message is sent when the daemon finishes reading ``stdin``.
+   bytes. The daemon will read this many bytes from ``stdin`` and use this as
+   the standard input for the next ``run``. An ``ok`` message is sent when the
+   daemon finishes reading ``stdin``.
 #. ``redirect_stderr_to_stdout``: This causes writes to ``stderr`` to be directed
    through ``stdout`` for the next ``run``. This is needed so that the order of
    content is preserved when stderr is redirected to stdout.

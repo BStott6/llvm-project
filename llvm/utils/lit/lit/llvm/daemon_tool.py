@@ -338,7 +338,6 @@ class DaemonTool:
 
     def command_input_string(self, s: bytes):
         self.send_command(f"in.str {len(s)}")
-        self.check_ok()
         self.daemon_proc.stdin.write(s)
         self.daemon_proc.stdin.flush()
         self.check_ok()
