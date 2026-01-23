@@ -497,9 +497,8 @@ class LLVMConfig(object):
                 ("%errc_EACCES", "'" + os.strerror(errno.EACCES) + "'")
             )
 
-    def use_default_substitutions(self):
+    def use_default_substitutions(self, add_filecheck=True):
         tool_patterns = [
-            ToolSubst("FileCheck", unresolved="fatal"),
             # Handle these specially as they are strings searched for during
             # testing.
             ToolSubst(
@@ -515,6 +514,8 @@ class LLVMConfig(object):
                 unresolved="fatal",
             ),
         ]
+        if add_filecheck:
+            tool_patterns.append(ToolSubst("FileCheck", unresolved="fatal"))
 
         self.config.substitutions.append(("%python", '"%s"' % (sys.executable)))
 
