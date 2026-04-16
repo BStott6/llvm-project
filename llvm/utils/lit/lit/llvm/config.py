@@ -1,3 +1,4 @@
+import functools
 import itertools
 import os
 import platform
@@ -7,6 +8,8 @@ import sys
 import errno
 
 import lit.util
+from lit.InprocBuiltins import InprocBuiltin
+from lit.llvm.daemon_tool import invoke_llvm_daemon_tool
 from lit.llvm.subst import FindTool
 from lit.llvm.subst import ToolSubst
 
@@ -28,6 +31,7 @@ class LLVMConfig(object):
     def __init__(self, lit_config, config):
         self.lit_config = lit_config
         self.config = config
+        self.daemonized_tools = LLVMConfig.get_daemonized_tools_from_env()
 
         features = config.available_features
 
@@ -447,6 +451,41 @@ class LLVMConfig(object):
         search_dirs = os.pathsep.join(search_dirs)
         substitutions = []
 
+        # Replace tool definitions for enabled daemon tools.
+        for tool_name in self.daemonized_tools:
+            existing_definition = next(
+                filter(
+                    lambda tool_subst: tool_subst.key == tool_name,
+                    tools,
+                ),
+                None,
+            )
+
+            if existing_definition:
+                tools.remove(existing_definition)
+            elif tool_name != "FileCheck":
+                # FileCheck is added automatically by Lit so won't be present
+                # in `tools`. Otherwise, if a daemon was requested but isn't
+                # present in the list of enabled tools, we ignore it.
+                continue
+
+            # Add alias for running the original tool without daemonization.
+            standalone_alias = f"%{tool_name}-standalone"
+            if existing_definition:
+                original_key = existing_definition.key
+                tools.append(ToolSubst(
+                    standalone_alias,
+                    FindTool(tool_name),
+                    unresolved=existing_definition.unresolved,
+                    extra_args=existing_definition.extra_args,
+                ))
+            else:
+                original_key = tool_name
+                tools.append(ToolSubst(standalone_alias, FindTool(tool_name)))
+
+            # Add alias for the daemon.
+            tools.append(ToolSubst(original_key, daemon_command=tool_name))
+
         for tool in tools:
             match = tool.resolve(self, search_dirs)
 
@@ -497,7 +536,7 @@ class LLVMConfig(object):
                 ("%errc_EACCES", "'" + os.strerror(errno.EACCES) + "'")
             )
 
-    def use_default_substitutions(self, add_filecheck=True):
+    def use_default_substitutions(self):
         tool_patterns = [
             # Handle these specially as they are strings searched for during
             # testing.
@@ -514,7 +553,7 @@ class LLVMConfig(object):
                 unresolved="fatal",
             ),
         ]
-        if add_filecheck:
+        if "FileCheck" not in self.daemonized_tools:
             tool_patterns.append(ToolSubst("FileCheck", unresolved="fatal"))
 
         self.config.substitutions.append(("%python", '"%s"' % (sys.executable)))
@@ -912,3 +951,50 @@ class LLVMConfig(object):
         self.add_tool_substitutions(tool_substitutions)
 
         return was_found
+
+    def get_daemon_inproc_builtin(
+        self, tool_name: str, search_dirs: list[str]
+    ) -> InprocBuiltin:
+        # Find the tool executable in the search directories.
+        tool_path = FindTool(tool_name).resolve(
+            self,
+            os.pathsep.join(search_dirs),
+        )
+        assert tool_path, f"Could not find {tool_name} in {search_dirs}"
+
+        return InprocBuiltin(
+            functools.partial(invoke_llvm_daemon_tool, tool_path),
+            fallback=tool_path,
+        )
+
+    def get_all_daemon_inproc_builtins(
+        self, search_dirs: list[str]
+    ):
+        return {
+            tool_name: self.get_daemon_inproc_builtin(tool_name, search_dirs)
+            for tool_name in self.daemonized_tools
+        }
+
+    @staticmethod
+    def get_daemonized_tools_from_env():
+        supported_daemonized_tools = ["FileCheck", "opt"]
+        daemon_tools_env_name = "LLVM_LIT_DAEMON_TOOLS"
+
+        daemonized_tools: list[str] = []
+
+        daemonized_tools_env = os.environ.get(daemon_tools_env_name)
+        if daemonized_tools_env:
+            if daemonized_tools_env == "all":
+                daemonized_tools = supported_daemonized_tools
+            else:
+                daemonized_tools = daemonized_tools_env.split(",")
+
+        for tool_name in daemonized_tools:
+            if tool_name not in supported_daemonized_tools:
+                raise RuntimeError(
+                    "'{}' is not a valid entry for '{}'."
+                        .format(tool_name, daemon_tools_env_name)
+                )
+
+        return daemonized_tools
+

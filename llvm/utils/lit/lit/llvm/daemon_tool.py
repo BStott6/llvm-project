@@ -1,4 +1,3 @@
-import functools
 import os
 import subprocess
 from threading import Thread
@@ -9,9 +8,7 @@ try:
 except ImportError:
     from Queue import Empty, Queue
 
-from lit.InprocBuiltins import InprocBuiltin, InprocBuiltinIO
-from lit.llvm.config import LLVMConfig
-from lit.llvm.subst import FindTool
+from lit.InprocBuiltins import InprocBuiltinIO
 from lit.ShCommands import Command
 from lit.ShellEnvironment import ShellEnvironment, kIsWindows
 
@@ -436,19 +433,3 @@ def invoke_llvm_daemon_tool(
 
     args[0] = executable_path
     return daemon.invoke(args, shenv, io.stdin, io.stdout, io.stderr)
-
-
-def get_llvm_daemon_inproc_builtin(
-    tool_name: str, config: LLVMConfig, search_dirs: list[str]
-) -> InprocBuiltin:
-    # Find the tool executable in the search directories.
-    tool_path = FindTool(tool_name).resolve(
-        config,
-        os.pathsep.join(search_dirs),
-    )
-    assert tool_path, f"Could not find {tool_name} in {search_dirs}"
-
-    return InprocBuiltin(
-        functools.partial(invoke_llvm_daemon_tool, tool_path),
-        fallback=tool_path,
-    )
