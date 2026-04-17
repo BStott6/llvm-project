@@ -180,6 +180,9 @@ using Statistic = NoopStatistic;
 /// Enable the collection and printing of statistics.
 LLVM_ABI void EnableStatistics(bool DoPrintOnExit = true);
 
+/// Disable the collection and printing of statistics.
+LLVM_ABI void DisableStatistics();
+
 /// Check if statistics are enabled.
 LLVM_ABI bool AreStatisticsEnabled();
 

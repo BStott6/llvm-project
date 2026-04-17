@@ -136,6 +136,10 @@ void llvm::EnableStatistics(bool DoPrintOnExit) {
   PrintOnExit = DoPrintOnExit;
 }
 
+void llvm::DisableStatistics() {
+  Enabled = false;
+}
+
 bool llvm::AreStatisticsEnabled() { return Enabled || EnableStats; }
 
 void StatisticInfo::sort() {
