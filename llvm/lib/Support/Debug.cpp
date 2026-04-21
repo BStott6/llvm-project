@@ -194,34 +194,53 @@ void llvm::initDebugOptions() {
 
 // Signal handlers - dump debug output on termination.
 static void debug_user_sig_handler(void *Cookie) {
-  // This is a bit sneaky.  Since this is under #ifndef NDEBUG, we
-  // know that debug mode is enabled and dbgs() really is a
-  // circular_raw_ostream.  If NDEBUG is defined, then dbgs() ==
-  // errs() but this will never be invoked.
-  llvm::circular_raw_ostream &dbgout =
-      static_cast<circular_raw_ostream &>(llvm::dbgs());
-  dbgout.flushBufferWithBanner();
+  dumpDebug();
 }
 
 /// dbgs - Return a circular-buffered debug stream.
 raw_ostream &llvm::dbgs() {
+  static bool InstalledDbgSignalHandler = false;
   // Do one-time initialization in a thread-safe way.
-  static struct dbgstream {
+  struct dbgstream {
     circular_raw_ostream strm;
 
     dbgstream()
         : strm(errs(), "*** Debug Log Output ***\n",
                (!EnableDebugBuffering || !DebugFlag) ? 0 : *DebugBufferSize) {
-      if (EnableDebugBuffering && DebugFlag && *DebugBufferSize != 0)
+      if (EnableDebugBuffering && DebugFlag && *DebugBufferSize != 0 &&
+          !InstalledDbgSignalHandler) {
         // TODO: Add a handler for SIGUSER1-type signals so the user can
         // force a debug dump.
         sys::AddSignalHandler(&debug_user_sig_handler, nullptr);
+        InstalledDbgSignalHandler = true;
+      }
       // Otherwise we've already set the debug stream buffer size to
       // zero, disabling buffering so it will output directly to errs().
     }
-  } thestrm;
+  };
+  static std::optional<dbgstream> DbgStream {};
+  static bool RecordedDebugFlag;
 
-  return thestrm.strm;
+  if (!DbgStream || RecordedDebugFlag != DebugFlag) {
+    // Recreate the stream as the debug flag has changed.
+    RecordedDebugFlag = DebugFlag;
+    DbgStream.emplace();
+  }
+
+  return DbgStream->strm;
+}
+
+void llvm::dumpDebug() {
+  // This is a bit sneaky.  Since this is under #ifndef NDEBUG, we
+  // know that debug mode is enabled and dbgs() really is a
+  // circular_raw_ostream.  If NDEBUG is defined, then dbgs() ==
+  // errs() but this will never be invoked.
+  if (EnableDebugBuffering && DebugFlag && *DebugBufferSize != 0) {
+
+    llvm::circular_raw_ostream &dbgout =
+        static_cast<circular_raw_ostream &>(llvm::dbgs());
+    dbgout.flushBufferWithBanner();
+  }
 }
 
 #else
@@ -231,6 +250,8 @@ namespace llvm {
   raw_ostream &dbgs() {
     return errs();
   }
+
+  void dumpDebug() {}
 }
 void llvm::initDebugOptions() {}
 #endif
