@@ -214,6 +214,7 @@ def gen_resultdb_test_entry(
         or result_code == lit.Test.XPASS
         or result_code == lit.Test.FLAKYPASS
         or result_code == lit.Test.FIXED
+        or result_code == lit.Test.FALLBACK
     ):
         test_data["status"] = "PASS"
     elif result_code == lit.Test.FAIL or result_code == lit.Test.XFAIL:

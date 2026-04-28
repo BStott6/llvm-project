@@ -49,6 +49,7 @@ PASS = ResultCode("PASS", "Passed", False)
 FLAKYPASS = ResultCode("FLAKYPASS", "Passed With Retry", False)
 FIXED = ResultCode("FIXED", "Passed After Update", False)
 XFAIL = ResultCode("XFAIL", "Expectedly Failed", False)
+FALLBACK = ResultCode("FALLBACK", "Passed With Fallback", False)
 # Failures
 UNRESOLVED = ResultCode("UNRESOLVED", "Unresolved", True)
 TIMEOUT = ResultCode("TIMEOUT", "Timed Out", True)

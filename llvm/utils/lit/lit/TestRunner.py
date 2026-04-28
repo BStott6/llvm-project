@@ -166,7 +166,14 @@ class TimeoutHelper(object):
             self._doneKillPass = True
 
 
-def executeShCmd(cmd, shenv, results, timeout=0, extra_inproc_builtins={}):
+def executeShCmd(
+    cmd,
+    shenv,
+    results,
+    timeout=0,
+    extra_inproc_builtins={},
+    replace_inproc_builtins_with_fallback=False,
+):
     """
     Wrapper around _executeShCmd that handles
     timeout
@@ -178,7 +185,12 @@ def executeShCmd(cmd, shenv, results, timeout=0, extra_inproc_builtins={}):
         timeoutHelper.startTimer()
     try:
         finalExitCode = _executeShCmd(
-            cmd, shenv, results, timeoutHelper, extra_inproc_builtins
+            cmd,
+            shenv,
+            results,
+            timeoutHelper,
+            extra_inproc_builtins,
+            replace_inproc_builtins_with_fallback,
         )
     except InternalShellError:
         e = sys.exc_info()[1]
@@ -446,7 +458,14 @@ def invoke_inproc_builtin(
     )
 
 
-def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
+def _executeShCmd(
+    cmd,
+    shenv,
+    results,
+    timeoutHelper,
+    extra_inproc_builtins,
+    replace_inproc_builtins_with_fallback,
+):
     if timeoutHelper.timeoutReached():
         # Prevent further recursion if the timeout has been hit
         # as we should try avoid launching more processes.
@@ -455,10 +474,20 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
     if isinstance(cmd, ShUtil.Seq):
         if cmd.op == ";":
             res = _executeShCmd(
-                cmd.lhs, shenv, results, timeoutHelper, extra_inproc_builtins
+                cmd.lhs,
+                shenv,
+                results,
+                timeoutHelper,
+                extra_inproc_builtins,
+                replace_inproc_builtins_with_fallback,
             )
             return _executeShCmd(
-                cmd.rhs, shenv, results, timeoutHelper, extra_inproc_builtins
+                cmd.rhs,
+                shenv,
+                results,
+                timeoutHelper,
+                extra_inproc_builtins,
+                replace_inproc_builtins_with_fallback,
             )
 
         if cmd.op == "&":
@@ -466,24 +495,44 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
 
         if cmd.op == "||":
             res = _executeShCmd(
-                cmd.lhs, shenv, results, timeoutHelper, extra_inproc_builtins
+                cmd.lhs,
+                shenv,
+                results,
+                timeoutHelper,
+                extra_inproc_builtins,
+                replace_inproc_builtins_with_fallback,
             )
             if res != 0:
                 res = _executeShCmd(
-                    cmd.rhs, shenv, results, timeoutHelper, extra_inproc_builtins
+                    cmd.rhs,
+                    shenv,
+                    results,
+                    timeoutHelper,
+                    extra_inproc_builtins,
+                    replace_inproc_builtins_with_fallback,
                 )
             return res
 
         if cmd.op == "&&":
             res = _executeShCmd(
-                cmd.lhs, shenv, results, timeoutHelper, extra_inproc_builtins
+                cmd.lhs,
+                shenv,
+                results,
+                timeoutHelper,
+                extra_inproc_builtins,
+                replace_inproc_builtins_with_fallback,
             )
             if res is None:
                 return res
 
             if res == 0:
                 res = _executeShCmd(
-                    cmd.rhs, shenv, results, timeoutHelper, extra_inproc_builtins
+                    cmd.rhs,
+                    shenv,
+                    results,
+                    timeoutHelper,
+                    extra_inproc_builtins,
+                    replace_inproc_builtins_with_fallback,
                 )
             return res
 
@@ -583,12 +632,12 @@ def _executeShCmd(cmd, shenv, results, timeoutHelper, extra_inproc_builtins):
             if not cmd_shenv is shenv:
                 error = "Error: 'env' cannot call '{}'".format(args[0])
 
-            if error:
-                if inproc_builtin.fallback is not None:
+            if inproc_builtin.fallback is not None:
+                if error or replace_inproc_builtins_with_fallback:
                     args[0] = inproc_builtin.fallback
                     inproc_builtin = None
-                else:
-                    raise InternalShellError(j, error)
+            elif error:
+                raise InternalShellError(j, error)
 
         # Resolve any out-of-process builtin command before adding back 'not'
         # commands.
@@ -860,6 +909,7 @@ def executeScriptInternal(
     cwd,
     debug=True,
     extra_inproc_builtins={},
+    replace_inproc_builtins_with_fallback=False,
 ) -> tuple[str, str, int, str | None, str | None]:
     cmds = []
     update_output = None
@@ -909,6 +959,7 @@ def executeScriptInternal(
         results,
         timeout=litConfig.maxIndividualTestTime,
         extra_inproc_builtins=extra_inproc_builtins,
+        replace_inproc_builtins_with_fallback=replace_inproc_builtins_with_fallback,
     )
 
     out = err = ""
@@ -2036,7 +2087,7 @@ def _runShTest(
 ) -> lit.Test.Result:
     # Always returns the tuple (out, err, exitCode, timeoutInfo, status).
     def runOnce(
-        execdir,
+        execdir, replace_inproc_builtins_with_fallback=False
     ) -> tuple[str, str, int, str | None, Test.ResultCode, str | None]:
         # script is modified below (for litConfig.per_test_coverage, and for
         # %dbg expansions).  runOnce can be called multiple times, but applying
@@ -2075,6 +2126,7 @@ def _runShTest(
                     scriptCopy,
                     execdir,
                     extra_inproc_builtins=extra_inproc_builtins,
+                    replace_inproc_builtins_with_fallback=replace_inproc_builtins_with_fallback,
                 )
         except ScriptFatal as e:
             out = f"# " + "\n# ".join(str(e).splitlines()) + "\n"
@@ -2090,6 +2142,32 @@ def _runShTest(
                 status = Test.TIMEOUT
         return out, err, exitCode, timeoutInfo, status, test_update_output
 
+    def runWithFallback(
+        execdir,
+    ) -> tuple[str, str, int, str | None, Test.ResultCode, str | None]:
+        # If the test failed, run again with in-process built-ins set to their
+        # fallback command.
+
+        out, err, exitCode, timeoutInfo, status, test_update_output = runOnce(execdir)
+        if status == Test.PASS:
+            return out, err, exitCode, timeoutInfo, status, test_update_output
+
+        if all(
+            inproc_builtin.fallback is None
+            for inproc_builtin in extra_inproc_builtins.values()
+        ):
+            # No fallback commands available.
+            return out, err, exitCode, timeoutInfo, status, test_update_output
+
+        out, err, exitCode, timeoutInfo, status, test_update_output = runOnce(
+            execdir,
+            replace_inproc_builtins_with_fallback=True,
+        )
+        if status == Test.PASS:
+            status = Test.FALLBACK
+
+        return out, err, exitCode, timeoutInfo, status, test_update_output
+
     # Create the output directory if it does not already exist.
     pathlib.Path(tmpBase).parent.mkdir(parents=True, exist_ok=True)
 
@@ -2098,7 +2176,7 @@ def _runShTest(
     attempts = test.allowed_retries + 1
     test_updates = []
     for i in range(attempts):
-        res = runOnce(execdir)
+        res = runWithFallback(execdir)
         out, err, exitCode, timeoutInfo, status, test_update_output = res
         test_updates.append(test_update_output)
         if status != Test.FAIL:
