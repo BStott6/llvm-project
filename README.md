@@ -11,7 +11,7 @@ and `FileCheck`, and gotten all of the `Transforms` tests working.
 Daemonization is enabled by specifying the `LIT_USE_DAEMON_TOOLS` environment
 variable before invoking Lit, for example:
 ```
-$ LIT_USE_DAEMON_TOOLS=opt,FileCheck build/bin/llvm-lit llvm/test/Transforms -v
+$ LLVM_LIT_DAEMON_TOOLS=all build/bin/llvm-lit llvm/test/Transforms -v
 ```
 ...to run the Transforms tests with both `opt` and `FileCheck` in daemon mode.
 
